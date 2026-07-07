@@ -114,7 +114,14 @@ function renderVideoCards(videos) {
     } else {
       const ext = video.type.toUpperCase();
       const res = video.resolution !== "Detected" ? video.resolution : "Direct";
-      const filename = getFilenameFromUrl(video.url);
+      
+      let displayTitle = getFilenameFromUrl(video.url);
+      let isYoutube = video.url && (video.url.includes("googlevideo.com") || video.url.includes("youtube.com"));
+      if (isYoutube && video.pageTitle) {
+        displayTitle = `${video.pageTitle} (${res})`;
+      }
+      
+      const downloadText = isYoutube ? `Download (${ext})` : `Download ${ext}`;
       
       card.innerHTML = `
         <div class="video-info">
@@ -125,12 +132,14 @@ function renderVideoCards(videos) {
             </svg>
           </div>
           <div class="video-meta">
-            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary); word-break: break-all;">${filename}</div>
-            <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">Direct download | Format: ${ext} | Resolution: ${res}</div>
+            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary); word-break: break-all;">${displayTitle}</div>
+            <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
+              ${isYoutube ? "YouTube Stream" : "Direct download"} | Format: ${ext} | Quality: ${res}
+            </div>
           </div>
         </div>
         <button class="btn btn-primary download-action-btn">
-          Download MP4
+          ${downloadText}
         </button>
       `;
 

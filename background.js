@@ -1,5 +1,56 @@
 import { parseM3U8 } from './hls-parser.js';
 
+const YOUTUBE_ITAGS = {
+  18: { resolution: "360p (MP4)", type: "mp4", title: "YouTube Video (with Audio)" },
+  22: { resolution: "720p (MP4)", type: "mp4", title: "YouTube Video (with Audio)" },
+  37: { resolution: "1080p (MP4)", type: "mp4", title: "YouTube Video (with Audio)" },
+  38: { resolution: "3072p (MP4)", type: "mp4", title: "YouTube Video (with Audio)" },
+  
+  // Video only (MP4 / AVC)
+  137: { resolution: "1080p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  136: { resolution: "720p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  135: { resolution: "480p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  134: { resolution: "360p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  133: { resolution: "240p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  160: { resolution: "144p (MP4)", type: "mp4", title: "YouTube Video (Video Only)" },
+  
+  // Video only (WebM / VP9)
+  248: { resolution: "1080p (WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  247: { resolution: "720p (WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  244: { resolution: "480p (WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  243: { resolution: "360p (WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  271: { resolution: "1440p (WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  313: { resolution: "2160p (4K, WebM)", type: "webm", title: "YouTube Video (Video Only)" },
+  
+  // Video only (AV1)
+  399: { resolution: "1080p (AV1)", type: "mp4", title: "YouTube Video (Video Only)" },
+  398: { resolution: "720p (AV1)", type: "mp4", title: "YouTube Video (Video Only)" },
+  397: { resolution: "480p (AV1)", type: "mp4", title: "YouTube Video (Video Only)" },
+  396: { resolution: "360p (AV1)", type: "mp4", title: "YouTube Video (Video Only)" },
+  
+  // Audio only
+  140: { resolution: "128kbps (M4A)", type: "m4a", title: "YouTube Audio" },
+  251: { resolution: "160kbps (WebM)", type: "webm", title: "YouTube Audio" },
+  139: { resolution: "48kbps (M4A)", type: "m4a", title: "YouTube Audio" },
+  171: { resolution: "128kbps (WebM)", type: "webm", title: "YouTube Audio" },
+  249: { resolution: "50kbps (WebM)", type: "webm", title: "YouTube Audio" },
+  250: { resolution: "70kbps (WebM)", type: "webm", title: "YouTube Audio" }
+};
+
+function cleanYoutubeUrl(urlStr) {
+  try {
+    const url = new URL(urlStr);
+    url.searchParams.delete("range");
+    url.searchParams.delete("rn");
+    url.searchParams.delete("obufp");
+    url.searchParams.delete("index");
+    url.searchParams.delete("sq");
+    return url.href;
+  } catch (e) {
+    return urlStr;
+  }
+}
+
 // Tab-based video database
 // tabId -> Array of detected video objects
 const tabVideoRegistry = {};
@@ -17,6 +68,31 @@ chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     const { url, tabId, type, responseHeaders } = details;
     if (tabId < 0) return;
+
+    // Intercept YouTube streams before other content type checks
+    if (url.includes("googlevideo.com/videoplayback") || url.includes("youtube.com/videoplayback")) {
+      try {
+        const urlObj = new URL(url);
+        const itagStr = urlObj.searchParams.get("itag");
+        if (itagStr) {
+          const itag = parseInt(itagStr);
+          const itagInfo = YOUTUBE_ITAGS[itag];
+          if (itagInfo) {
+            registerVideo(tabId, {
+              url: url,
+              type: "youtube_stream",
+              quality: "YouTube",
+              resolution: itagInfo.resolution,
+              title: itagInfo.title,
+              itag: itag
+            });
+            return;
+          }
+        }
+      } catch (e) {
+        console.error("[Detector] Error intercepting YouTube stream:", e);
+      }
+    }
 
     // Filter out navigation frames (which represent HTML pages)
     if (type === "main_frame" || type === "sub_frame") {
@@ -69,9 +145,23 @@ chrome.webRequest.onHeadersReceived.addListener(
         return;
       }
 
+      const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
+      const isManifest = contentType.includes("mpegurl") || contentType.includes("dash+xml") || cleanUrl.includes(".m3u8") || cleanUrl.includes(".mpd");
+
+      // Check Content-Length size constraint (must be at least 500 KB for direct media)
+      const contentLengthHeader = responseHeaders.find(
+        (h) => h.name.toLowerCase() === "content-length"
+      );
+      if (contentLengthHeader && !isManifest) {
+        const size = parseInt(contentLengthHeader.value);
+        if (!isNaN(size) && size < 512000) {
+          console.log(`[Detector] Skipping small network media (${size} bytes): ${url}`);
+          return;
+        }
+      }
+
       let mediaType = null;
       let mediaTitle = "";
-      const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
 
       // 1. Detect HLS & DASH streams by mime-type or manifest extensions
       if (contentType.includes("application/x-mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || cleanUrl.includes(".m3u8")) {
@@ -151,33 +241,92 @@ function registerVideo(tabId, video) {
     tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v.type === "hls");
   }
 
-  const getCleanUrl = (url) => url.split('?')[0].split('#')[0];
-  const videoCleanUrl = getCleanUrl(video.url);
+  const isYoutube = (video.url && (video.url.includes("googlevideo.com/videoplayback") || video.url.includes("youtube.com/videoplayback"))) || video.type === "youtube_stream" || video.itag;
+  const isManifest = video.type === "hls" || video.type === "dash" || (video.url && (video.url.includes(".m3u8") || video.url.includes(".mpd")));
 
-  // Check if a video with the same clean URL already exists
-  const exists = tabVideoRegistry[tabId].some(v => getCleanUrl(v.url) === videoCleanUrl);
-  if (!exists) {
-    chrome.tabs.get(tabId, async (tab) => {
-      if (chrome.runtime.lastError) return;
-      video.pageTitle = tab.title || "Video Stream";
-      
-      // Fetch HLS qualities in background immediately to calculate options count
-      if (video.type === "hls") {
-        try {
-          console.log("[Detector] Parsing HLS qualities in background...");
-          const qualities = await parseM3U8(video.url);
-          video.qualities = qualities || [];
-        } catch (e) {
-          console.warn("[Detector] Failed HLS quality check in background:", e);
-          video.qualities = [];
+  const doRegister = () => {
+    let exists = false;
+    if (isYoutube) {
+      const itag = video.itag || (video.url ? new URL(video.url).searchParams.get("itag") : null);
+      exists = tabVideoRegistry[tabId].some(v => {
+        const vIsYoutube = (v.url && (v.url.includes("googlevideo.com/videoplayback") || v.url.includes("youtube.com/videoplayback"))) || v.type === "youtube_stream" || v.itag;
+        if (vIsYoutube) {
+          const vItag = v.itag || (v.url ? new URL(v.url).searchParams.get("itag") : null);
+          return String(vItag) === String(itag);
         }
-      }
+        return false;
+      });
+    } else {
+      const getCleanUrl = (url) => url.split('?')[0].split('#')[0];
+      const videoCleanUrl = getCleanUrl(video.url);
+      exists = tabVideoRegistry[tabId].some(v => getCleanUrl(v.url) === videoCleanUrl);
+    }
 
-      tabVideoRegistry[tabId].push(video);
-      console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
-      
-      updateBadgeCount(tabId);
-    });
+    if (!exists) {
+      chrome.tabs.get(tabId, async (tab) => {
+        if (chrome.runtime.lastError) return;
+        
+        // If it's YouTube, normalize properties using YOUTUBE_ITAGS
+        if (isYoutube) {
+          const itag = video.itag || (video.url ? new URL(video.url).searchParams.get("itag") : null);
+          if (itag) {
+            const itagInt = parseInt(itag);
+            const itagInfo = YOUTUBE_ITAGS[itagInt];
+            if (itagInfo) {
+              video.type = itagInfo.type;
+              video.quality = "YouTube";
+              video.resolution = itagInfo.resolution;
+              video.title = itagInfo.title;
+              video.itag = itagInt;
+              if (video.url) {
+                video.url = cleanYoutubeUrl(video.url);
+              }
+            }
+          }
+        }
+
+        video.pageTitle = tab.title || "Video Stream";
+        
+        // Fetch HLS qualities in background immediately to calculate options count
+        if (video.type === "hls") {
+          try {
+            console.log("[Detector] Parsing HLS qualities in background...");
+            const qualities = await parseM3U8(video.url);
+            video.qualities = qualities || [];
+          } catch (e) {
+            console.warn("[Detector] Failed HLS quality check in background:", e);
+            video.qualities = [];
+          }
+        }
+
+        tabVideoRegistry[tabId].push(video);
+        console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
+        
+        updateBadgeCount(tabId);
+      });
+    }
+  };
+
+  // If it's a DOM-detected direct video, check its size via HEAD request first
+  if (video.quality === "DOM" && !isYoutube && !isManifest && video.url) {
+    fetch(video.url, { method: "HEAD" })
+      .then((res) => {
+        const len = res.headers.get("content-length");
+        if (len) {
+          const size = parseInt(len);
+          if (!isNaN(size) && size < 512000) {
+            console.log(`[Detector] Skipping small DOM media (${size} bytes): ${video.url}`);
+            return;
+          }
+        }
+        doRegister();
+      })
+      .catch((err) => {
+        // Fallback: register anyway if the HEAD request fails
+        doRegister();
+      });
+  } else {
+    doRegister();
   }
 }
 
@@ -259,6 +408,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }).catch(() => {});
     delete activeDownloads[tabId];
     closeOffscreenDocument();
+  }
+});
+
+// Clear tab registry when navigating to a new URL
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) {
+    console.log(`[Detector] Tab ${tabId} navigated to ${changeInfo.url}. Clearing registry.`);
+    tabVideoRegistry[tabId] = [];
+    chrome.action.setBadgeText({ tabId, text: "" });
   }
 });
 

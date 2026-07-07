@@ -211,15 +211,16 @@ body {
 }
 
 .video-icon-wrapper {
-  width: 36px;
+  width: 64px;
   height: 36px;
-  border-radius: 8px;
+  border-radius: 6px;
   background-color: rgba(99, 102, 241, 0.1);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--accent-primary);
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 .video-icon-wrapper svg {

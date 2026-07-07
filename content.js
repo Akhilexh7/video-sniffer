@@ -12,7 +12,9 @@ function scanPageForVideos() {
   const sources = document.querySelectorAll("video source");
   sources.forEach((source) => {
     if (source.src) {
-      reportVideo(source.src, "source");
+      const parentVideo = source.closest("video");
+      const thumbnail = parentVideo ? parentVideo.poster : null;
+      reportVideo(source.src, "source", thumbnail);
     }
   });
 
@@ -20,7 +22,16 @@ function scanPageForVideos() {
   const iframes = document.querySelectorAll("iframe");
   iframes.forEach((iframe) => {
     if (iframe.src && (iframe.src.includes("youtube.com/embed/") || iframe.src.includes("player.vimeo.com/video/"))) {
-      reportVideo(iframe.src, "iframe");
+      let thumbnail = null;
+      if (iframe.src.includes("youtube.com/embed/")) {
+        try {
+          const match = iframe.src.match(/\/embed\/([^/?#]+)/);
+          if (match && match[1]) {
+            thumbnail = `https://img.youtube.com/vi/${match[1]}/mqdefault.jpg`;
+          }
+        } catch (e) {}
+      }
+      reportVideo(iframe.src, "iframe", thumbnail);
     }
   });
 }
@@ -39,7 +50,7 @@ function handleVideoElement(video) {
   }
 
   if (video.src) {
-    reportVideo(video.src, "video");
+    reportVideo(video.src, "video", video.poster);
   }
 
   // Monitor for changes in the src attribute of this video element
@@ -50,7 +61,7 @@ function handleVideoElement(video) {
         if (video.loop && video.muted && !video.controls) return;
         if (video.offsetWidth > 0 && video.offsetWidth < 200) return;
         
-        reportVideo(video.src, "video_changed");
+        reportVideo(video.src, "video_changed", video.poster);
       }
     });
   });
@@ -58,7 +69,7 @@ function handleVideoElement(video) {
 }
 
 // Reports the video to background.js
-function reportVideo(url, source) {
+function reportVideo(url, source, thumbnail) {
   if (!url) return;
   
   // Ignore Blob URLs since background.js catches their underlying network requests (HLS/DASH/MP4)
@@ -112,7 +123,8 @@ function reportVideo(url, source) {
         quality: "DOM",
         resolution: type === "hls" || type === "dash" ? "Auto" : "Direct",
         title: title,
-        source: source
+        source: source,
+        thumbnail: thumbnail || null
       }
     }).catch((err) => {
       // Suppress connection errors if background is reloading
@@ -161,3 +173,150 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   return true;
 });
+
+// --- YouTube Sniffer Logic ---
+function injectMainWorldScript() {
+  const scriptStr = `
+    (function() {
+      if (window.__youtube_sniffer_injected__) return;
+      window.__youtube_sniffer_injected__ = true;
+
+      console.log("[YouTube Sniffer] Main world script injected.");
+
+      function checkAndPostPlayerResponse() {
+        const player = document.getElementById("movie_player");
+        if (player && typeof player.getPlayerResponse === "function") {
+          const response = player.getPlayerResponse();
+          if (response) {
+            window.postMessage({
+              type: "YOUTUBE_PLAYER_RESPONSE",
+              response: response,
+              title: document.title
+            }, "*");
+          }
+        } else if (window.ytInitialPlayerResponse) {
+          window.postMessage({
+            type: "YOUTUBE_PLAYER_RESPONSE",
+            response: window.ytInitialPlayerResponse,
+            title: document.title
+          }, "*");
+        }
+      }
+
+      // Check immediately
+      checkAndPostPlayerResponse();
+
+      // Check on player state changes or page navigations
+      document.addEventListener("yt-navigate-finish", () => {
+        setTimeout(checkAndPostPlayerResponse, 500);
+      });
+      document.addEventListener("yt-page-data-updated", () => {
+        setTimeout(checkAndPostPlayerResponse, 500);
+      });
+
+      // Intercept dynamic XHR/fetch player responses
+      const originalFetch = window.fetch;
+      window.fetch = async function(...args) {
+        const response = await originalFetch.apply(this, args);
+        const url = args[0];
+        if (typeof url === 'string' && url.includes('/youtubei/v1/player')) {
+          try {
+            const clone = response.clone();
+            const json = await clone.json();
+            window.postMessage({ type: 'YOUTUBE_PLAYER_RESPONSE', response: json, title: document.title }, '*');
+          } catch (e) {}
+        }
+        return response;
+      };
+
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        this._url = url;
+        return originalOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function() {
+        this.addEventListener('load', function() {
+          if (this._url && this._url.includes('/youtubei/v1/player')) {
+            try {
+              const json = JSON.parse(this.responseText);
+              window.postMessage({ type: 'YOUTUBE_PLAYER_RESPONSE', response: json, title: document.title }, '*');
+            } catch (e) {}
+          }
+        });
+        return originalSend.apply(this, arguments);
+      };
+
+      // Periodic fallback check (e.g. for SPA transition edge cases)
+      let lastUrl = window.location.href;
+      setInterval(() => {
+        if (window.location.href !== lastUrl) {
+          lastUrl = window.location.href;
+          setTimeout(checkAndPostPlayerResponse, 1000);
+        }
+      }, 1000);
+    })();
+  `;
+
+  const script = document.createElement("script");
+  script.textContent = scriptStr;
+  (document.head || document.documentElement).appendChild(script);
+  script.remove();
+}
+
+function handleYouTubeResponse(response, pageTitle) {
+  const streamingData = response.streamingData;
+  if (!streamingData) return;
+
+  // Extract thumbnail
+  let thumbnail = null;
+  if (response.videoDetails && response.videoDetails.thumbnail && response.videoDetails.thumbnail.thumbnails) {
+    const thumbs = response.videoDetails.thumbnail.thumbnails;
+    if (thumbs.length > 0) {
+      thumbnail = thumbs[thumbs.length - 1].url;
+    }
+  }
+  if (!thumbnail && response.videoDetails && response.videoDetails.videoId) {
+    thumbnail = `https://img.youtube.com/vi/${response.videoDetails.videoId}/mqdefault.jpg`;
+  }
+
+  const formats = [];
+  if (streamingData.formats) {
+    formats.push(...streamingData.formats);
+  }
+  if (streamingData.adaptiveFormats) {
+    formats.push(...streamingData.adaptiveFormats);
+  }
+
+  formats.forEach((format) => {
+    // Only report direct URLs (no signatureCipher here, those are handled via network interception in background.js)
+    if (format.url) {
+      chrome.runtime.sendMessage({
+        action: "register_detected_video",
+        video: {
+          url: format.url,
+          type: "youtube_stream",
+          quality: "YouTube",
+          resolution: "Detect",
+          title: "YouTube Video",
+          pageTitle: pageTitle,
+          itag: format.itag,
+          thumbnail: thumbnail
+        }
+      }).catch(() => {});
+    }
+  });
+}
+
+// Set up listeners for messages from main world
+window.addEventListener("message", (event) => {
+  if (event.source !== window) return;
+  if (event.data && event.data.type === "YOUTUBE_PLAYER_RESPONSE") {
+    handleYouTubeResponse(event.data.response, event.data.title);
+  }
+});
+
+// Run YouTube sniffer if on YouTube
+if (window.location.hostname.includes("youtube.com")) {
+  injectMainWorldScript();
+}
