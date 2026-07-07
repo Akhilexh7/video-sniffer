@@ -116,52 +116,8 @@ export class HlsDownloader {
       throw new Error("Download aborted.");
     }
 
-    console.log("[Downloader] All segments downloaded and decrypted. Transmuxing streams to MP4...");
-    
-    let finalBlob;
-    if (typeof muxjs !== "undefined") {
-      console.log("[Downloader] mux.js detected. Transmuxing TS to MP4...");
-      try {
-        const transmuxer = new muxjs.mp4.Transmuxer();
-        const mp4Segments = [];
-        let initSegment = null;
-
-        transmuxer.on('data', (event) => {
-          // Accept all event data payloads (combined, video, audio) to prevent 0-byte saves for demuxed streams
-          if (event.data) {
-            mp4Segments.push(event.data);
-          }
-          if (event.initSegment) {
-            initSegment = event.initSegment;
-          }
-        });
-
-        // Feed each decrypted TS segment buffer sequentially to the transmuxer
-        for (let i = 0; i < buffers.length; i++) {
-          if (buffers[i]) {
-            transmuxer.push(new Uint8Array(buffers[i]));
-            transmuxer.flush();
-          }
-        }
-
-        const mp4Data = [];
-        if (initSegment) {
-          mp4Data.push(initSegment);
-        }
-        mp4Data.push(...mp4Segments);
-
-        finalBlob = new Blob(mp4Data, { type: "video/mp4" });
-        console.log("[Downloader] Transmuxing complete. Output size:", finalBlob.size);
-      } catch (err) {
-        console.error("[Downloader] Transmuxing failed, falling back to raw TS save:", err);
-        finalBlob = new Blob(buffers, { type: "video/mp4" });
-      }
-    } else {
-      console.warn("[Downloader] mux.js not found. Saving concatenated TS as MP4...");
-      finalBlob = new Blob(buffers, { type: "video/mp4" });
-    }
-
-    return finalBlob;
+    console.log("[Downloader] All segments downloaded and decrypted. Merging streams...");
+    return new Blob(buffers, { type: "video/mp4" });
   }
 
   async fetchSegmentWithRetry(url, retries) {

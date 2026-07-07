@@ -43,19 +43,17 @@ async function init() {
   closeDialogBtn.addEventListener("click", () => qualityDialog.classList.add("hidden"));
 }
 
-// // Fetches list of detected HLS videos from background service worker
 function refreshVideoList() {
   chrome.runtime.sendMessage({ action: "get_detected_videos", tabId: activeTabId }, async (response) => {
     if (response && response.videos && response.videos.length > 0) {
-      // Filter list to HLS videos only (per user request)
-      const hlsVideos = response.videos.filter(v => v.type === "hls");
-      currentVideos = hlsVideos;
-      
-      if (hlsVideos.length > 0) {
-        renderVideoCards(hlsVideos);
-      } else {
-        showState("waiting");
-      }
+      // Sort videos: HLS streams first, then direct video files
+      const sortedVideos = [...response.videos].sort((a, b) => {
+        if (a.type === "hls" && b.type !== "hls") return -1;
+        if (a.type !== "hls" && b.type === "hls") return 1;
+        return 0;
+      });
+      currentVideos = sortedVideos;
+      renderVideoCards(sortedVideos);
     } else {
       showState("waiting");
     }
@@ -76,44 +74,84 @@ function showState(state) {
   }
 }
 
-// Renders detected HLS streams as card items
+// Renders HLS streams at the top and direct media links below
 function renderVideoCards(videos) {
   videoList.innerHTML = "";
   showState("detected");
 
-  videos.forEach((video, index) => {
+  videos.forEach((video) => {
     const card = document.createElement("div");
     card.className = "video-card";
     
-    card.innerHTML = `
-      <div class="video-info">
-        <div class="video-icon-wrapper">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polygon points="23 7 16 12 23 17 23 7"></polygon>
-            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-          </svg>
+    if (video.type === "hls") {
+      card.innerHTML = `
+        <div class="video-info">
+          <div class="video-icon-wrapper">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="23 7 16 12 23 17 23 7"></polygon>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+            </svg>
+          </div>
+          <div class="video-meta">
+            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--accent-primary);">HLS Video (Multi-Quality)</div>
+            <div class="video-domain" style="font-size: 11px; margin-top: 2px;">Select quality and download as MP4</div>
+          </div>
         </div>
-        <div class="video-meta">
-          <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--accent-primary);">HLS Video (Multi-Quality)</div>
-          <div class="video-domain" style="font-size: 11px; margin-top: 2px;">Select quality and download as MP4</div>
-        </div>
-      </div>
-      <button class="btn btn-primary download-action-btn">
-        Select Quality
-      </button>
-    `;
+        <button class="btn btn-primary download-action-btn">
+          Select Quality
+        </button>
+      `;
 
-    // Click on the card or action button triggers the quality picker modal
-    card.querySelector(".download-action-btn").addEventListener("click", () => {
-      handleHlsCardClick(video);
-    });
-    card.addEventListener("click", (e) => {
-      if (!e.target.classList.contains("download-action-btn")) {
+      card.querySelector(".download-action-btn").addEventListener("click", () => {
         handleHlsCardClick(video);
-      }
-    });
+      });
+      card.addEventListener("click", (e) => {
+        if (!e.target.classList.contains("download-action-btn")) {
+          handleHlsCardClick(video);
+        }
+      });
+    } else {
+      const ext = video.type.toUpperCase();
+      const res = video.resolution !== "Detected" ? video.resolution : "Direct";
+      card.innerHTML = `
+        <div class="video-info">
+          <div class="video-icon-wrapper">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="23 7 16 12 23 17 23 7"></polygon>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+            </svg>
+          </div>
+          <div class="video-meta">
+            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${ext} Video File</div>
+            <div class="video-domain" style="font-size: 11px; margin-top: 2px;">Format: ${ext} | Resolution: ${res}</div>
+          </div>
+        </div>
+        <button class="btn btn-primary download-action-btn">
+          Download MP4
+        </button>
+      `;
+
+      card.querySelector(".download-action-btn").addEventListener("click", () => {
+        triggerDirectDownload(video.url);
+      });
+      card.addEventListener("click", (e) => {
+        if (!e.target.classList.contains("download-action-btn")) {
+          triggerDirectDownload(video.url);
+        }
+      });
+    }
 
     videoList.appendChild(card);
+  });
+}
+
+function triggerDirectDownload(url) {
+  console.log(`[Downloader] Starting direct download for URL: ${url}`);
+  chrome.downloads.download({
+    url: url,
+    saveAs: true
+  }, () => {
+    window.close();
   });
 }
 
