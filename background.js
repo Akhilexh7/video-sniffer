@@ -1,3 +1,5 @@
+import { parseM3U8 } from './hls-parser.js';
+
 // Tab-based video database
 // tabId -> Array of detected video objects
 const tabVideoRegistry = {};
@@ -130,10 +132,23 @@ function cleanUrlEndsWith(url, ext) {
   return clean.endsWith(ext);
 }
 
-// Registers the detected video, ensuring uniqueness
+// Registers the detected video, ensuring uniqueness and computing exact options count
 function registerVideo(tabId, video) {
   if (!tabVideoRegistry[tabId]) {
     tabVideoRegistry[tabId] = [];
+  }
+
+  // 1. Prioritize HLS streams: if HLS is already registered, skip direct links (prevents background preview/ad clutter)
+  const hasHls = tabVideoRegistry[tabId].some(v => v.type === "hls");
+  if (hasHls && video.type !== "hls") {
+    console.log(`[Detector] HLS stream already sniffed. Ignoring direct link: ${video.url}`);
+    return;
+  }
+
+  // 2. If the new stream is HLS, clear out any direct video files (previews/ads) previously registered
+  if (video.type === "hls" && !hasHls) {
+    console.log(`[Detector] Sniffed HLS stream. Purging direct video files to keep list clean.`);
+    tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v.type === "hls");
   }
 
   const getCleanUrl = (url) => url.split('?')[0].split('#')[0];
@@ -142,18 +157,45 @@ function registerVideo(tabId, video) {
   // Check if a video with the same clean URL already exists
   const exists = tabVideoRegistry[tabId].some(v => getCleanUrl(v.url) === videoCleanUrl);
   if (!exists) {
-    // Add page title placeholder, content script will update it if possible
-    chrome.tabs.get(tabId, (tab) => {
+    chrome.tabs.get(tabId, async (tab) => {
       if (chrome.runtime.lastError) return;
       video.pageTitle = tab.title || "Video Stream";
-      tabVideoRegistry[tabId].push(video);
-      console.log(`[Detector] Video URL registered in Tab ${tabId}: ${video.url}`);
       
-      // Update badge count
-      chrome.action.setBadgeText({ tabId, text: String(tabVideoRegistry[tabId].length) });
-      chrome.action.setBadgeBackgroundColor({ tabId, color: "#4f46e5" });
+      // Fetch HLS qualities in background immediately to calculate options count
+      if (video.type === "hls") {
+        try {
+          console.log("[Detector] Parsing HLS qualities in background...");
+          const qualities = await parseM3U8(video.url);
+          video.qualities = qualities || [];
+        } catch (e) {
+          console.warn("[Detector] Failed HLS quality check in background:", e);
+          video.qualities = [];
+        }
+      }
+
+      tabVideoRegistry[tabId].push(video);
+      console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
+      
+      updateBadgeCount(tabId);
     });
   }
+}
+
+// Recalculates total downloading options available and updates badge text
+function updateBadgeCount(tabId) {
+  const registry = tabVideoRegistry[tabId] || [];
+  let totalOptions = 0;
+  
+  registry.forEach((v) => {
+    if (v.type === "hls") {
+      totalOptions += (v.qualities && v.qualities.length > 0) ? v.qualities.length : 1;
+    } else {
+      totalOptions += 1;
+    }
+  });
+
+  chrome.action.setBadgeText({ tabId, text: String(totalOptions) });
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#4f46e5" });
 }
 
 // 3. Handle messages from Content Script and Popup UI

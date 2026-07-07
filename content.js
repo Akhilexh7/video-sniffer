@@ -152,3 +152,12 @@ pageObserver.observe(document.body || document.documentElement, {
   childList: true,
   subtree: true
 });
+
+// Responds to duration query from popup to calculate quality file size estimates
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "get_video_duration") {
+    const video = document.querySelector("video");
+    sendResponse({ duration: video ? video.duration : 0 });
+  }
+  return true;
+});

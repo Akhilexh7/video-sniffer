@@ -9,6 +9,7 @@ export class HlsDownloader {
     this.progress = 0;
     this.totalSegments = 0;
     this.downloadedSegments = 0;
+    this.downloadedBytes = 0;
     
     // Encryption key details
     this.cryptoKey = null;
@@ -56,6 +57,7 @@ export class HlsDownloader {
       try {
         const initBuffer = await this.fetchSegmentWithRetry(initSegmentUrl, 2);
         this.initSegmentBuffer = initBuffer;
+        this.downloadedBytes += initBuffer.byteLength;
         console.log("[Downloader] Initialization segment downloaded successfully.");
       } catch (err) {
         console.error("[Downloader] Failed to fetch HLS initialization segment:", err);
@@ -110,10 +112,11 @@ export class HlsDownloader {
           }
 
           buffers[item.index] = finalBuffer;
+          this.downloadedBytes += finalBuffer.byteLength;
           
           this.downloadedSegments++;
           this.progress = Math.round((this.downloadedSegments / this.totalSegments) * 100);
-          this.onProgress(this.progress);
+          this.onProgress({ percentage: this.progress, downloadedBytes: this.downloadedBytes });
         } catch (e) {
           if (this.cancelled) return;
           console.error(`[Downloader] Segment ${item.index} failed permanently:`, e);

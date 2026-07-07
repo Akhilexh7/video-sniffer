@@ -44,32 +44,25 @@
 
       <!-- State 2: Detected Videos List -->
       <div id="state-detected" class="view-state hidden">
+        <!-- Active Download Banner (Inline) -->
+        <div id="download-progress-banner" class="download-banner hidden">
+          <div class="banner-info">
+            <span class="banner-title">Downloading Stream...</span>
+            <span id="banner-percentage">0%</span>
+          </div>
+          <div class="banner-bar-bg">
+            <div id="banner-bar-fill" class="banner-bar-fill"></div>
+          </div>
+          <div class="banner-actions">
+            <span id="banner-detail" class="banner-detail">Fetching chunks...</span>
+            <button id="banner-cancel-btn" class="banner-cancel-btn">Cancel</button>
+          </div>
+        </div>
+
         <h2 class="section-title">Detected Media</h2>
         <div id="video-list" class="video-list-container">
           <!-- Dynamic Items Injected Here -->
         </div>
-      </div>
-
-      <!-- State 3: Active Download Progress -->
-      <div id="state-downloading" class="view-state hidden">
-        <div class="progress-ring-container">
-          <svg class="progress-ring" width="120" height="120">
-            <circle class="progress-ring-bg" stroke="#1e293b" stroke-width="8" fill="transparent" r="50" cx="60" cy="60"/>
-            <circle id="progress-bar-circle" class="progress-ring-fill" stroke="url(#gradient)" stroke-width="8" stroke-dasharray="314.16" stroke-dashoffset="314.16" fill="transparent" r="50" cx="60" cy="60"/>
-            <defs>
-              <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stop-color="#6366f1" />
-                <stop offset="100%" stop-color="#3b82f6" />
-              </linearGradient>
-            </defs>
-          </svg>
-          <div class="progress-text-container">
-            <span id="progress-percentage">0%</span>
-          </div>
-        </div>
-        <h2 class="state-title">Downloading Video</h2>
-        <p id="download-detail" class="state-desc">Fetching media chunks...</p>
-        <button id="cancel-download-btn" class="btn btn-danger">Cancel Download</button>
       </div>
 
     </main>
