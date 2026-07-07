@@ -14,6 +14,9 @@ export class HlsDownloader {
     this.cryptoKey = null;
     this.keyIvHex = null;
     this.mediaSequence = 0;
+    
+    // fMP4 initialization segment details
+    this.initSegmentBuffer = null;
   }
 
   // Aborts all ongoing HTTP requests and marks download as cancelled
@@ -46,7 +49,21 @@ export class HlsDownloader {
       throw new Error("No video segments detected in playlist.");
     }
 
-    // 1. Detect and parse HLS AES-128 Encryption details
+    // 1. Detect and download fMP4 initialization segment (#EXT-X-MAP) if present
+    const initSegmentUrl = this.parseInitSegmentUrl(text);
+    if (initSegmentUrl) {
+      console.log(`[Downloader] Fragmented MP4 (fMP4) stream detected. Fetching initialization header: ${initSegmentUrl}`);
+      try {
+        const initBuffer = await this.fetchSegmentWithRetry(initSegmentUrl, 2);
+        this.initSegmentBuffer = initBuffer;
+        console.log("[Downloader] Initialization segment downloaded successfully.");
+      } catch (err) {
+        console.error("[Downloader] Failed to fetch HLS initialization segment:", err);
+        throw new Error(`Failed downloading initialization segment: ${err.message}`);
+      }
+    }
+
+    // 2. Detect and parse HLS AES-128 Encryption details
     this.mediaSequence = this.parseMediaSequence(text);
     const keyInfo = this.parseKeyInfo(text);
     if (keyInfo) {
@@ -80,7 +97,7 @@ export class HlsDownloader {
           
           let finalBuffer = rawBuffer;
           
-          // 2. Perform AES decryption if key exists
+          // 3. Perform AES decryption if key exists
           if (this.cryptoKey) {
             let iv;
             if (this.keyIvHex) {
@@ -117,7 +134,16 @@ export class HlsDownloader {
     }
 
     console.log("[Downloader] All segments downloaded and decrypted. Merging streams...");
-    return new Blob(buffers, { type: "video/mp4" });
+    
+    // 4. Prepend fMP4 initialization header to compiled segment list
+    const finalBuffers = [];
+    if (this.initSegmentBuffer) {
+      finalBuffers.push(this.initSegmentBuffer);
+    }
+    finalBuffers.push(...buffers);
+
+    // Concatenate chunks into a single binary Blob
+    return new Blob(finalBuffers, { type: "video/mp4" });
   }
 
   async fetchSegmentWithRetry(url, retries) {
@@ -169,6 +195,21 @@ export class HlsDownloader {
   parseMediaSequence(playlistText) {
     const match = playlistText.match(/#EXT-X-MEDIA-SEQUENCE:([0-9]+)/i);
     return match ? parseInt(match[1]) : 0;
+  }
+
+  // Parses fMP4 HLS initialization map segment URL from manifest
+  parseInitSegmentUrl(playlistText) {
+    const lines = playlistText.split("\n");
+    for (let line of lines) {
+      line = line.trim();
+      if (line.startsWith("#EXT-X-MAP:")) {
+        const uriMatch = line.match(/URI=["']([^"']+)["']/i);
+        if (uriMatch) {
+          return this.resolveUrl(this.m3u8Url, uriMatch[1]);
+        }
+      }
+    }
+    return null;
   }
 
   // Parses key method, uri, and custom IV from manifest
