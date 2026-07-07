@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XDownloader Popup</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        <h1 class="logo-title">X<span>Downloader</span></h1>
+      </div>
+      <span class="version-tag">v1.0</span>
+    </header>
+
+    <!-- Content Area -->
+    <main class="app-main">
+      
+      <!-- State 1: Scanning/Waiting (No videos detected yet) -->
+      <div id="state-waiting" class="view-state">
+        <div class="pulse-container">
+          <div class="pulse-ring ring-1"></div>
+          <div class="pulse-ring ring-2"></div>
+          <div class="pulse-center">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+          </div>
+        </div>
+        <h2 class="state-title">Scanning Webpage...</h2>
+        <p class="state-desc">Play or refresh the video on the page if it is not detected automatically.</p>
+      </div>
+
+      <!-- State 2: Detected Videos List -->
+      <div id="state-detected" class="view-state hidden">
+        <h2 class="section-title">Detected Media</h2>
+        <div id="video-list" class="video-list-container">
+          <!-- Dynamic Items Injected Here -->
+        </div>
+      </div>
+
+      <!-- State 3: Active Download Progress -->
+      <div id="state-downloading" class="view-state hidden">
+        <div class="progress-ring-container">
+          <svg class="progress-ring" width="120" height="120">
+            <circle class="progress-ring-bg" stroke="#1e293b" stroke-width="8" fill="transparent" r="50" cx="60" cy="60"/>
+            <circle id="progress-bar-circle" class="progress-ring-fill" stroke="url(#gradient)" stroke-width="8" stroke-dasharray="314.16" stroke-dashoffset="314.16" fill="transparent" r="50" cx="60" cy="60"/>
+            <defs>
+              <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#6366f1" />
+                <stop offset="100%" stop-color="#3b82f6" />
+              </linearGradient>
+            </defs>
+          </svg>
+          <div class="progress-text-container">
+            <span id="progress-percentage">0%</span>
+          </div>
+        </div>
+        <h2 class="state-title">Downloading Video</h2>
+        <p id="download-detail" class="state-desc">Fetching media chunks...</p>
+        <button id="cancel-download-btn" class="btn btn-danger">Cancel Download</button>
+      </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>Supports HLS (.m3u8), MP4, and standard video elements.</p>
+    </footer>
+  </div>
+
+  <!-- Quality Option Modal/Popover template (Dynamic) -->
+  <div id="quality-dialog" class="quality-dialog hidden">
+    <div class="dialog-content">
+      <div class="dialog-header">
+        <h3>Choose Quality</h3>
+        <button id="close-dialog-btn" class="close-btn">&times;</button>
+      </div>
+      <div id="quality-options" class="options-list">
+        <!-- Dynamic Quality Lists Injected Here -->
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

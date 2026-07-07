@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "XDownloader - Video Detector & Downloader",
+  "version": "1.0",
+  "description": "Detects and downloads videos (HTML5 & HLS/m3u8) directly from any webpage.",
+  "permissions": [
+    "webRequest",
+    "downloads",
+    "storage",
+    "activeTab",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "XDownloader"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["hls-parser.js", "downloader.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
