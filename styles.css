@@ -89,6 +89,34 @@ body {
   position: relative;
 }
 
+.app-main,
+.options-list {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(99, 102, 241, 0.65) rgba(11, 15, 25, 0.35);
+}
+
+.app-main::-webkit-scrollbar,
+.options-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.app-main::-webkit-scrollbar-track,
+.options-list::-webkit-scrollbar-track {
+  background: rgba(11, 15, 25, 0.35);
+  border-radius: 999px;
+}
+
+.app-main::-webkit-scrollbar-thumb,
+.options-list::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.9), rgba(59, 130, 246, 0.75));
+  border-radius: 999px;
+}
+
+.app-main::-webkit-scrollbar-thumb:hover,
+.options-list::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--accent-primary), var(--accent-secondary));
+}
+
 .view-state {
   display: flex;
   flex-direction: column;
@@ -210,20 +238,39 @@ body {
   gap: 10px;
 }
 
-.video-icon-wrapper {
+.video-preview {
   width: 64px;
   height: 36px;
   border-radius: 6px;
-  background-color: rgba(99, 102, 241, 0.1);
+  background: linear-gradient(135deg, rgba(20, 184, 166, 0.18), rgba(99, 102, 241, 0.2));
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--accent-primary);
   flex-shrink: 0;
   overflow: hidden;
+  position: relative;
+  aspect-ratio: 16 / 9;
 }
 
-.video-icon-wrapper svg {
+.video-preview-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 1;
+}
+
+.video-preview-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.video-preview-fallback svg {
   width: 20px;
   height: 20px;
 }
@@ -236,9 +283,9 @@ body {
 .video-title {
   font-size: 13px;
   font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
   margin-bottom: 2px;
 }
 

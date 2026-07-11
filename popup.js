@@ -50,12 +50,7 @@ async function init() {
 function refreshVideoList() {
   chrome.runtime.sendMessage({ action: "get_detected_videos", tabId: activeTabId }, async (response) => {
     if (response && response.videos && response.videos.length > 0) {
-      // Sort videos: HLS streams first, then direct video files
-      const sortedVideos = [...response.videos].sort((a, b) => {
-        if (a.type === "hls" && b.type !== "hls") return -1;
-        if (a.type !== "hls" && b.type === "hls") return 1;
-        return 0;
-      });
+      const sortedVideos = sortVideosBySize(response.videos);
       currentVideos = sortedVideos;
       renderVideoCards(sortedVideos);
     } else {
@@ -75,6 +70,31 @@ function showState(state) {
   }
 }
 
+function sortVideosBySize(videos) {
+  return [...videos].sort((a, b) => {
+    const sizeA = getSortableSizeBytes(a);
+    const sizeB = getSortableSizeBytes(b);
+
+    if (sizeA !== sizeB) return sizeB - sizeA;
+    if (a.type === "hls" && b.type !== "hls") return -1;
+    if (a.type !== "hls" && b.type === "hls") return 1;
+    return 0;
+  });
+}
+
+function getSortableSizeBytes(video) {
+  if (video.sizeBytes) return Number(video.sizeBytes) || 0;
+
+  if (video.type === "hls") {
+    const bandwidth = getBestHlsBandwidth(video);
+    if (bandwidth) {
+      return (bandwidth / 8) * 3600;
+    }
+  }
+
+  return 0;
+}
+
 // Renders HLS streams at the top and direct media links below
 function renderVideoCards(videos) {
   videoList.innerHTML = "";
@@ -83,19 +103,14 @@ function renderVideoCards(videos) {
   videos.forEach((video) => {
     const card = document.createElement("div");
     card.className = "video-card";
+    const previewMarkup = createPreviewMarkup(video);
     
     if (video.type === "hls") {
       card.innerHTML = `
         <div class="video-info">
-          <div class="video-icon-wrapper">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="23 7 16 12 23 17 23 7"></polygon>
-              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-            </svg>
-          </div>
+          ${previewMarkup}
           <div class="video-meta">
             <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--accent-primary);">${video.pageTitle || "HLS Video Stream"}</div>
-            <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">Multi-quality | Select your quality</div>
           </div>
         </div>
         <button class="btn btn-primary download-action-btn">
@@ -112,6 +127,7 @@ function renderVideoCards(videos) {
         }
       });
     } else {
+      const sizeText = getCardSizeText(video);
       const ext = video.type.toUpperCase();
       const res = video.resolution !== "Detected" ? video.resolution : "Direct";
       
@@ -125,16 +141,11 @@ function renderVideoCards(videos) {
       
       card.innerHTML = `
         <div class="video-info">
-          <div class="video-icon-wrapper">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="23 7 16 12 23 17 23 7"></polygon>
-              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-            </svg>
-          </div>
+          ${previewMarkup}
           <div class="video-meta">
-            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary); word-break: break-all;">${displayTitle}</div>
+            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
             <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
-              ${isYoutube ? "YouTube Stream" : "Direct download"} | Format: ${ext} | Quality: ${res}
+              ${isYoutube ? "YouTube Stream | " : ""}<span class="video-size">${sizeText}</span>
             </div>
           </div>
         </div>
@@ -144,17 +155,143 @@ function renderVideoCards(videos) {
       `;
 
       card.querySelector(".download-action-btn").addEventListener("click", () => {
-        triggerDirectDownload(video.url);
+        if (video.audioUrl) {
+          startCombinedMediaDownload(video);
+        } else {
+          startDirectDownload(video);
+        }
       });
       card.addEventListener("click", (e) => {
         if (!e.target.classList.contains("download-action-btn")) {
-          triggerDirectDownload(video.url);
+          if (video.audioUrl) {
+            startCombinedMediaDownload(video);
+          } else {
+            startDirectDownload(video);
+          }
         }
       });
     }
 
     videoList.appendChild(card);
+    requestVideoPreview(card, video);
   });
+}
+
+function createPreviewMarkup(video) {
+  const thumbnail = getVideoThumbnail(video);
+  const imageMarkup = thumbnail
+    ? `<img class="video-preview-image" src="${escapeAttribute(thumbnail)}" alt="">`
+    : "";
+
+  return `
+    <div class="video-preview">
+      ${imageMarkup}
+      <div class="video-preview-fallback">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </div>
+    </div>
+  `;
+}
+
+function getVideoThumbnail(video) {
+  if (video.thumbnail) return video.thumbnail;
+
+  try {
+    const url = new URL(video.url);
+    const youtubeId = getYoutubeId(url);
+    if (youtubeId) {
+      return `https://img.youtube.com/vi/${youtubeId}/mqdefault.jpg`;
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+function getYoutubeId(url) {
+  if (url.hostname.includes("youtube.com")) {
+    if (url.pathname.startsWith("/embed/")) {
+      return url.pathname.split("/embed/")[1].split("/")[0];
+    }
+    return url.searchParams.get("v");
+  }
+  if (url.hostname.includes("youtu.be")) {
+    return url.pathname.slice(1).split("/")[0];
+  }
+  return null;
+}
+
+function requestVideoPreview(card, video) {
+  if (!activeTabId || getVideoThumbnail(video)) return;
+
+  chrome.tabs.sendMessage(activeTabId, { action: "get_video_preview", url: video.url }, (response) => {
+    if (chrome.runtime.lastError || !response || !response.preview) return;
+
+    const preview = card.querySelector(".video-preview");
+    if (!preview || preview.querySelector(".video-preview-image")) return;
+
+    const img = document.createElement("img");
+    img.className = "video-preview-image";
+    img.alt = "";
+    img.src = response.preview;
+    preview.prepend(img);
+  });
+}
+
+function escapeAttribute(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[char]));
+}
+
+function getCardSizeText(video, duration = 0) {
+  if (video.sizeBytes) {
+    return `Size: ${formatMegabytes(video.sizeBytes)}`;
+  }
+
+  if (video.type === "hls") {
+    const bandwidth = getBestHlsBandwidth(video);
+    if (bandwidth) {
+      return `Size: ${estimateSizeText(bandwidth, duration)}`;
+    }
+  }
+
+  return "Size: unknown";
+}
+
+function getBestHlsBandwidth(video) {
+  if (!video.qualities || video.qualities.length === 0) return 0;
+
+  return video.qualities.reduce((best, quality) => {
+    return Math.max(best, Number(quality.bandwidth) || 0);
+  }, 0);
+}
+
+function updateHlsCardSize(card, video) {
+  if (video.type !== "hls" || !activeTabId || !getBestHlsBandwidth(video)) return;
+
+  chrome.tabs.sendMessage(activeTabId, { action: "get_video_duration" }, (response) => {
+    if (chrome.runtime.lastError) return;
+
+    const duration = (response && response.duration) ? response.duration : 0;
+    if (!duration) return;
+
+    const sizeEl = card.querySelector(".video-size");
+    if (sizeEl) {
+      sizeEl.textContent = getCardSizeText(video, duration);
+    }
+  });
+}
+
+function formatMegabytes(bytes) {
+  const mb = bytes / (1024 * 1024);
+  return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
 }
 
 function triggerDirectDownload(url) {
@@ -188,12 +325,7 @@ function estimateSizeText(bandwidth, duration) {
   const bytes = (bandwidth / 8) * secs;
   const mb = bytes / (1024 * 1024);
   
-  let formatted = "";
-  if (mb >= 1024) {
-    formatted = `${(mb / 1024).toFixed(1)} GB`;
-  } else {
-    formatted = `${Math.round(mb)} MB`;
-  }
+  const formatted = `${Math.round(mb)} MB`;
   
   return isEstimatePerHour ? `~${formatted}/hr` : `~${formatted}`;
 }
@@ -210,7 +342,7 @@ async function handleHlsCardClick(video) {
       const duration = (response && response.duration) ? response.duration : 0;
       
       try {
-        const qualities = await parseM3U8(video.url);
+        const qualities = await parseM3U8(video.url, activeTabId);
         
         if (qualities.length === 0) {
           qualityOptions.innerHTML = "";
@@ -281,6 +413,27 @@ function startHlsDownload(m3u8Url, qualityTitle) {
   showDownloadProgress(0);
 }
 
+function startCombinedMediaDownload(video) {
+  chrome.runtime.sendMessage({
+    action: "start_combined_media_download",
+    tabId: activeTabId,
+    videoUrl: video.url,
+    audioUrl: video.audioUrl,
+    pageTitle: video.pageTitle || getFilenameFromUrl(video.url)
+  });
+  showDownloadProgress(0);
+}
+
+function startDirectDownload(video) {
+  chrome.runtime.sendMessage({
+    action: "start_direct_download",
+    tabId: activeTabId,
+    url: video.url,
+    pageTitle: video.pageTitle || getFilenameFromUrl(video.url)
+  });
+  showDownloadProgress(0);
+}
+
 function cancelDownload() {
   chrome.runtime.sendMessage({ action: "cancel_hls_download", tabId: activeTabId }, () => {
     hideDownloadProgress();
@@ -328,11 +481,13 @@ function hideDownloadProgress() {
   downloadProgressBanner.classList.add("hidden");
 }
 
-// Listen to download progress notifications from background script
+// Listen to download progress and state reset notifications from background script
 chrome.runtime.onMessage.addListener((message) => {
   if (message.tabId !== activeTabId) return;
 
-  if (message.action === "download_progress_update") {
+  if (message.action === "video_registry_cleared") {
+    refreshVideoList();
+  } else if (message.action === "download_progress_update") {
     showDownloadProgress(message.progress);
   } else if (message.action === "offscreen_download_complete") {
     hideDownloadProgress();
