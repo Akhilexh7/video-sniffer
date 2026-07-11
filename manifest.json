@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "XDownloader - Video Detector & Downloader",
+  "name": "UNV Downloader - Video Detector & Downloader",
   "version": "1.0",
   "description": "Detects and downloads videos (HTML5 & HLS/m3u8) directly from any webpage.",
+  "icons": {
+    "16": "logo/icon-16.png",
+    "32": "logo/icon-32.png",
+    "48": "logo/icon-48.png",
+    "128": "logo/icon-128.png"
+  },
   "permissions": [
     "webRequest",
     "downloads",
@@ -33,7 +39,11 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "XDownloader"
+    "default_title": "UNV Downloader",
+    "default_icon": {
+      "16": "logo/icon-16.png",
+      "32": "logo/icon-32.png"
+    }
   },
   "web_accessible_resources": [
     {

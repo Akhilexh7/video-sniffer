@@ -7,7 +7,6 @@ let currentVideos = [];
 // DOM Elements
 const stateWaiting = document.getElementById("state-waiting");
 const stateDetected = document.getElementById("state-detected");
-
 const videoList = document.getElementById("video-list");
 
 // Inline Download Banner Elements
@@ -45,6 +44,11 @@ async function init() {
   // Setup static event listeners
   bannerCancelBtn.addEventListener("click", cancelDownload);
   closeDialogBtn.addEventListener("click", () => qualityDialog.classList.add("hidden"));
+  qualityDialog.addEventListener("click", (e) => {
+    if (e.target === qualityDialog) {
+      qualityDialog.classList.add("hidden");
+    }
+  });
 }
 
 function refreshVideoList() {
@@ -63,10 +67,14 @@ function showState(state) {
   stateWaiting.classList.add("hidden");
   stateDetected.classList.add("hidden");
 
+  const appMain = document.querySelector(".app-main");
+
   if (state === "waiting") {
     stateWaiting.classList.remove("hidden");
+    if (appMain) appMain.style.overflowY = "hidden";
   } else if (state === "detected") {
     stateDetected.classList.remove("hidden");
+    if (appMain) appMain.style.overflowY = "auto";
   }
 }
 
@@ -141,26 +149,34 @@ function renderVideoCards(videos) {
     } else {
       const sizeText = getCardSizeText(video);
       const ext = video.type.toLowerCase();
-      const res = video.resolution !== "Detected" ? video.resolution : "Direct";
+      const rawRes = video.resolution !== "Detected" ? video.resolution : "Direct";
+      const res = getFormattedResolution(rawRes) || rawRes;
       
-      let displayTitle = getFilenameFromUrl(video.url);
-      if (video.pageTitle && video.pageTitle !== "Video Stream") {
-        displayTitle = video.pageTitle;
+      let displayTitle = video.pageTitle || getFilenameFromUrl(video.url);
+      if (displayTitle === "Video Stream" && video.url) {
+        displayTitle = getFilenameFromUrl(video.url);
       }
+      
       let isYoutube = video.url && (video.url.includes("googlevideo.com") || video.url.includes("youtube.com"));
-      if (isYoutube && video.pageTitle) {
-        displayTitle = `${video.pageTitle} (${res})`;
+      if (res && res !== "Direct" && res !== "Auto") {
+        displayTitle = `${displayTitle} (${res})`;
       }
       
       const downloadText = isYoutube ? `Download (${ext.toUpperCase()})` : `Download ${ext.toUpperCase()}`;
+      const qualityLabel = (res && res !== "Direct" && res !== "Auto") ? ` &middot; ${res}` : "";
       
+      const isSizeKnown = !sizeText.includes("Unknown");
+      const sizeMarkup = isSizeKnown
+        ? `<span class="size-highlight" style="color: var(--accent-secondary); font-weight: 600;">${sizeText}</span>`
+        : `<span>${sizeText}</span>`;
+
       card.innerHTML = `
         <div class="video-info">
           ${previewMarkup}
           <div class="video-meta">
             <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
             <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
-              <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeText}</span>
+              <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeMarkup}${qualityLabel}</span>
             </div>
           </div>
         </div>
@@ -248,7 +264,6 @@ function renderVideoCards(videos) {
     toggleContainer.appendChild(collapsedContent);
     videoList.appendChild(toggleContainer);
     
-    // Ensure hidden class initially hides the content
     collapsedContent.style.display = "none";
   }
 }
@@ -256,7 +271,7 @@ function renderVideoCards(videos) {
 function createPreviewMarkup(video) {
   const thumbnail = getVideoThumbnail(video);
   const imageMarkup = thumbnail
-    ? `<img class="video-preview-image" src="${escapeAttribute(thumbnail)}" alt="">`
+    ? `<img class="video-preview-image" src="${escapeAttribute(thumbnail)}" onerror="this.style.display='none'; this.onerror=null;" alt="">`
     : "";
 
   return `
@@ -311,6 +326,10 @@ function requestVideoPreview(card, video) {
     const img = document.createElement("img");
     img.className = "video-preview-image";
     img.alt = "";
+    img.onerror = () => {
+      img.style.display = "none";
+      img.onerror = null;
+    };
     img.src = response.preview;
     preview.prepend(img);
   });
@@ -349,49 +368,11 @@ function getBestHlsBandwidth(video) {
   }, 0);
 }
 
-function updateHlsCardSize(card, video) {
-  if (video.type !== "hls" || !activeTabId || !getBestHlsBandwidth(video)) return;
-
-  chrome.tabs.sendMessage(activeTabId, { action: "get_video_duration" }, (response) => {
-    if (chrome.runtime.lastError) return;
-
-    const duration = (response && response.duration) ? response.duration : 0;
-    if (!duration) return;
-
-    const sizeEl = card.querySelector(".video-size");
-    if (sizeEl) {
-      sizeEl.textContent = getCardSizeText(video, duration);
-    }
-  });
-}
-
 function formatMegabytes(bytes) {
   const mb = bytes / (1024 * 1024);
   return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
 }
 
-function triggerDirectDownload(url) {
-  console.log(`[Downloader] Starting direct download for URL: ${url}`);
-  chrome.downloads.download({
-    url: url,
-    saveAs: true
-  }, () => {
-    window.close();
-  });
-}
-
-// Parses default download filename from direct URL paths
-function getFilenameFromUrl(url) {
-  try {
-    const pathname = new URL(url).pathname;
-    const filename = pathname.substring(pathname.lastIndexOf('/') + 1);
-    return filename ? decodeURIComponent(filename) : "video.mp4";
-  } catch (e) {
-    return "video.mp4";
-  }
-}
-
-// Estimates file size based on bandwidth and video duration (defaults to 1h average if duration is unavailable)
 function estimateSizeText(bandwidth, duration) {
   if (!bandwidth) return "";
   
@@ -406,7 +387,16 @@ function estimateSizeText(bandwidth, duration) {
   return isEstimatePerHour ? `~${formatted}/hr` : `~${formatted}`;
 }
 
-// Opens the quality picker modal, queries video duration from content script, and lists HLS qualities with sizes
+function getFilenameFromUrl(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const filename = pathname.substring(pathname.lastIndexOf('/') + 1);
+    return filename ? decodeURIComponent(filename) : "video.mp4";
+  } catch (e) {
+    return "video.mp4";
+  }
+}
+
 // Opens the quality picker modal, queries video duration from content script, and lists HLS or YouTube qualities
 async function handleMultiQualityCardClick(video) {
   try {
@@ -446,7 +436,6 @@ async function handleMultiQualityCardClick(video) {
     }
 
     console.log("[Popup] Querying active video duration for size estimation...");
-    // Query active video duration from content script context
     chrome.tabs.sendMessage(activeTabId, { action: "get_video_duration" }, async (response) => {
       const duration = (response && response.duration) ? response.duration : 0;
       
@@ -460,7 +449,6 @@ async function handleMultiQualityCardClick(video) {
             startHlsDownload(video.url, "Auto", video.frameId || null);
           });
         } else {
-          // Sort HLS quality list in descending order (highest resolution first)
           const sortedQualities = [...qualities].sort((q1, q2) => {
             const r1 = parseInt(q1.resolution) || 0;
             const r2 = parseInt(q2.resolution) || 0;
@@ -495,7 +483,6 @@ function fallbackHlsDownload(video) {
   });
 }
 
-// Injects option buttons in modal with estimated sizes
 function createModalOptionButton(qualityTitle, resolution, estimatedSize, onClick) {
   const btn = document.createElement("button");
   btn.className = "quality-option-btn";
@@ -524,12 +511,16 @@ function startHlsDownload(m3u8Url, qualityTitle, frameId) {
 }
 
 function startYoutubeDownload(videoUrl, audioUrl, pageTitle, resolution, frameId) {
+  let title = pageTitle || "youtube_video";
+  if (resolution) {
+    title = `${title}_${resolution}`;
+  }
   chrome.runtime.sendMessage({
     action: "start_youtube_download",
     tabId: activeTabId,
     videoUrl: videoUrl,
     audioUrl: audioUrl,
-    pageTitle: pageTitle,
+    pageTitle: title,
     resolution: resolution,
     frameId: frameId
   });
@@ -537,23 +528,49 @@ function startYoutubeDownload(videoUrl, audioUrl, pageTitle, resolution, frameId
 }
 
 function startCombinedMediaDownload(video) {
+  const rawRes = video.resolution !== "Detected" ? video.resolution : "Direct";
+  const res = getFormattedResolution(rawRes) || rawRes;
+  let title = video.pageTitle || getFilenameFromUrl(video.url);
+  if (res && res !== "Direct" && res !== "Auto") {
+    title = `${title}_${res}`;
+  }
   chrome.runtime.sendMessage({
     action: "start_combined_media_download",
     tabId: activeTabId,
     videoUrl: video.url,
     audioUrl: video.audioUrl,
-    pageTitle: video.pageTitle || getFilenameFromUrl(video.url),
+    pageTitle: title,
     frameId: video.frameId || null
   });
   showDownloadProgress(0);
 }
 
+// In popup.js, getFormattedResolution resolves actual dimensions into standard labels
+function getFormattedResolution(res) {
+  if (!res || res === "Detected" || res === "Direct" || res === "Auto") return "";
+  if (res.includes("x")) {
+    const parts = res.split("x");
+    const width = parseInt(parts[0], 10);
+    const height = parseInt(parts[1], 10);
+    if (!isNaN(width) && !isNaN(height)) {
+      return `${Math.min(width, height)}p`;
+    }
+  }
+  return res;
+}
+
 function startDirectDownload(video) {
+  const rawRes = video.resolution !== "Detected" ? video.resolution : "Direct";
+  const res = getFormattedResolution(rawRes) || rawRes;
+  let title = video.pageTitle || getFilenameFromUrl(video.url);
+  if (res && res !== "Direct" && res !== "Auto") {
+    title = `${title}_${res}`;
+  }
   chrome.runtime.sendMessage({
     action: "start_direct_download",
     tabId: activeTabId,
     url: video.url,
-    pageTitle: video.pageTitle || getFilenameFromUrl(video.url),
+    pageTitle: title,
     expectedSize: video.sizeBytes || null,
     frameId: video.frameId || null
   });
@@ -567,7 +584,6 @@ function cancelDownload() {
   });
 }
 
-// Helper to format bytes to MB/GB
 function formatBytes(bytes) {
   if (!bytes) return "0.0 MB";
   const mb = bytes / (1024 * 1024);
@@ -577,32 +593,47 @@ function formatBytes(bytes) {
   return `${mb.toFixed(1)} MB`;
 }
 
-// Updates the inline download progress banner
 function showDownloadProgress(progress) {
   downloadProgressBanner.classList.remove("hidden");
   
   let percentage = 0;
   let bytes = 0;
+  let totalBytes = null;
   
   if (typeof progress === "object" && progress !== null) {
     percentage = progress.percentage || 0;
     bytes = progress.downloadedBytes || 0;
+    totalBytes = progress.totalBytes;
   } else {
     percentage = progress || 0;
   }
   
-  bannerPercentage.innerText = formatBytes(bytes);
-  bannerBarFill.style.width = `${percentage}%`;
+  const downloadedText = formatBytes(bytes);
+  const totalText = totalBytes ? formatBytes(totalBytes) : "?";
+  bannerPercentage.innerText = `${downloadedText} / ${totalText}`;
   
-  if (percentage < 100) {
-    bannerDetail.innerHTML = `Fetching segment chunks... (${percentage}%)`;
-  } else {
-    bannerDetail.innerHTML = `Assembly complete! Save prompted...`;
-    setTimeout(hideDownloadProgress, 4000); // Auto-hide after 4 seconds
+  const pctString = `${percentage}%`;
+  bannerBarFill.style.width = pctString;
+  
+  // Drive scrubber tooltip via custom properties and data attributes
+  const trackEl = downloadProgressBanner.querySelector(".banner-bar-bg");
+  if (trackEl) {
+    trackEl.style.setProperty("--progress-pct", pctString);
+    trackEl.setAttribute("data-percentage", pctString);
+  }
+  
+  if (typeof progress === "object" && progress !== null) {
+    if (progress.status === "muxing") {
+      bannerDetail.innerText = "Muxing audio and video... (please wait)";
+    } else if (progress.status === "completed") {
+      bannerDetail.innerHTML = `Assembly complete! Save prompted...`;
+      setTimeout(hideDownloadProgress, 4000); // Auto-hide after 4 seconds
+    } else {
+      bannerDetail.innerText = `Downloading segment ${progress.segmentIndex + 1} of ${progress.totalSegments}`;
+    }
   }
 }
 
-// Hides the inline progress banner
 function hideDownloadProgress() {
   downloadProgressBanner.classList.add("hidden");
 }

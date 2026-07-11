@@ -198,7 +198,7 @@ export class DirectMediaDownloader {
           this.downloadedBytes += buffer.byteLength;
           
           const percentage = Math.round((this.downloadedBytes / contentLength) * 100);
-          this.onProgress({ percentage, downloadedBytes: this.downloadedBytes });
+          this.onProgress({ percentage, downloadedBytes: this.downloadedBytes, totalBytes: contentLength });
         } catch (e) {
           if (this.cancelled) return;
           console.error(`[DirectMediaDownloader] Chunk ${item.index} failed:`, e);
@@ -242,7 +242,7 @@ export class DirectMediaDownloader {
       }, "arraybuffer");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
-      this.onProgress({ percentage: 100, downloadedBytes: blob.size });
+      this.onProgress({ percentage: 100, downloadedBytes: blob.size, totalBytes: blob.size });
       return blob;
     }
 
@@ -268,7 +268,7 @@ export class DirectMediaDownloader {
       this.downloadedBytes += value.length;
 
       const percentage = totalBytes > 0 ? Math.round((this.downloadedBytes / totalBytes) * 100) : 0;
-      this.onProgress({ percentage, downloadedBytes: this.downloadedBytes });
+      this.onProgress({ percentage, downloadedBytes: this.downloadedBytes, totalBytes: totalBytes || null });
     }
 
     if (this.cancelled) {

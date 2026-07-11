@@ -129,7 +129,8 @@ async function handleHlsDownload(tabId, m3u8Url, qualityTitle, pageTitle, frameI
     // 3. Create Object URL (Supported here!)
     const objectUrl = URL.createObjectURL(blob);
     
-    const safeTitle = sanitizeFilename(pageTitle, "hls_video");
+    const qualitySuffix = (qualityTitle && qualityTitle !== "Auto") ? `_${qualityTitle}` : "";
+    const safeTitle = sanitizeFilename(`${pageTitle}${qualitySuffix}`, "hls_video");
 
     console.log(`[Offscreen] Merging complete. Triggering native anchor download for: ${safeTitle}.${extension}`);
     

@@ -213,7 +213,7 @@ function reportVideo(url, source, thumbnail, trackHints = {}, mediaExtras = {}) 
         url: url,
         type: type,
         quality: "DOM",
-        resolution: type === "hls" || type === "dash" ? "Auto" : "Direct",
+        resolution: trackHints.resolution || (type === "hls" || type === "dash" ? "Auto" : "Direct"),
         title: title,
         source: source,
         thumbnail: thumbnail || null,
@@ -231,10 +231,12 @@ function reportVideo(url, source, thumbnail, trackHints = {}, mediaExtras = {}) 
 function getMediaTrackHints(video) {
   let hasAudio;
   let hasVideo;
+  let resolution;
 
   try {
     if (video.videoWidth || video.videoHeight) {
       hasVideo = true;
+      resolution = `${video.videoWidth}x${video.videoHeight}`;
     }
 
     if (video.audioTracks && typeof video.audioTracks.length === "number") {
@@ -244,7 +246,7 @@ function getMediaTrackHints(video) {
     }
   } catch (e) {}
 
-  return { hasAudio, hasVideo };
+  return { hasAudio, hasVideo, resolution };
 }
 
 function reportMediaCandidate(candidate, source, thumbnail) {
@@ -479,8 +481,8 @@ function debounce(fn, delay) {
 function injectEarlyMediaSnifferScript() {
   const scriptStr = `
     (function() {
-      if (window.__xdownloader_media_sniffer_injected__) return;
-      window.__xdownloader_media_sniffer_injected__ = true;
+      if (window.__unvdownloader_media_sniffer_injected__) return;
+      window.__unvdownloader_media_sniffer_injected__ = true;
 
       const mediaUrlPattern = /\\.(m3u8|mpd|mp4|webm|mkv|flv|avi|mov|3gp)(?:[?#]|$)/i;
 
@@ -523,7 +525,7 @@ function injectEarlyMediaSnifferScript() {
 
       const originalOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url) {
-        this.__xdownloader_url = url;
+        this.__unvdownloader_url = url;
         maybePostUrl(url, "xhr");
         return originalOpen.apply(this, arguments);
       };
@@ -647,12 +649,84 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "get_video_duration") {
     const video = document.querySelector("video");
     sendResponse({ duration: video ? video.duration : 0 });
+    return true;
   } else if (message.action === "get_video_preview") {
     const video = findMatchingVideo(message.url) || getPrimaryVideo();
-    sendResponse({ preview: getVideoPreview(video) });
+    const preview = getVideoPreview(video);
+    if (preview) {
+      sendResponse({ preview: preview });
+    } else {
+      generateFrameThumbnail(message.url)
+        .then((fallback) => {
+          sendResponse({ preview: fallback });
+        })
+        .catch(() => {
+          sendResponse({ preview: null });
+        });
+      return true; // Keep message channel open for async response
+    }
   }
   return true;
 });
+
+async function generateFrameThumbnail(videoUrl, seekTo = null) {
+  if (!videoUrl || videoUrl.includes(".m3u8") || videoUrl.startsWith("blob:")) {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.crossOrigin = "anonymous";
+    video.preload = "metadata"; // triggers only a small initial range request, not full download
+    video.muted = true;
+    video.playsInline = true;
+    video.style.display = "none";
+    document.body.appendChild(video);
+
+    let settled = false;
+    const cleanup = () => {
+      video.remove();
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    // Give up after 3.5s so a broken/slow stream never hangs the popup
+    const timeout = setTimeout(() => finish(null), 3500);
+
+    video.addEventListener("loadedmetadata", () => {
+      const target = seekTo ?? Math.min(video.duration * 0.1, 3);
+      video.currentTime = isFinite(target) && target > 0 ? target : 0.1;
+    });
+
+    video.addEventListener("seeked", () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 320;
+        canvas.height = video.videoHeight
+          ? Math.round((video.videoHeight / video.videoWidth) * 320)
+          : 180;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        clearTimeout(timeout);
+        finish(canvas.toDataURL("image/jpeg", 0.7));
+      } catch (e) {
+        clearTimeout(timeout);
+        finish(null);
+      }
+    });
+
+    video.addEventListener("error", () => {
+      clearTimeout(timeout);
+      finish(null);
+    });
+
+    video.src = videoUrl;
+  });
+}
 
 function findMatchingVideo(url) {
   if (!url) return null;

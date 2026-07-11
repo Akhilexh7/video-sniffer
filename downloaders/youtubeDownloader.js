@@ -26,22 +26,31 @@ export class YoutubeDownloader {
     let audioProgress = 0;
     let videoBytes = 0;
     let audioBytes = 0;
+    let videoTotalBytes = 0;
+    let audioTotalBytes = 0;
 
     const updateProgress = () => {
       const totalBytes = videoBytes + audioBytes;
+      const totalExpectedBytes = videoTotalBytes + audioTotalBytes;
       const percentage = Math.round((videoProgress + audioProgress) / 2);
-      this.onProgress({ percentage, downloadedBytes: totalBytes });
+      this.onProgress({ 
+        percentage, 
+        downloadedBytes: totalBytes, 
+        totalBytes: totalExpectedBytes > 0 ? totalExpectedBytes : null 
+      });
     };
 
     this.videoDownloader = new DirectMediaDownloader(this.videoUrl, (p) => {
       videoProgress = p.percentage;
       videoBytes = p.downloadedBytes;
+      if (p.totalBytes) videoTotalBytes = p.totalBytes;
       updateProgress();
     }, this.tabId, this.frameId);
 
     this.audioDownloader = new DirectMediaDownloader(this.audioUrl, (p) => {
       audioProgress = p.percentage;
       audioBytes = p.downloadedBytes;
+      if (p.totalBytes) audioTotalBytes = p.totalBytes;
       updateProgress();
     }, this.tabId, this.frameId);
 

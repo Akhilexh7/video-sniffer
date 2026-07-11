@@ -89,11 +89,19 @@ export async function parseM3U8(m3u8Url, tabId = null, frameId = null) {
 
       if (urlLine) {
         const fullUrl = resolveUrl(finalUrl, urlLine);
-        const quality = metadata.resolution 
-          ? `${metadata.resolution.split("x")[1]}p` 
-          : metadata.bandwidth 
-            ? `${Math.round(metadata.bandwidth / 1000)}k` 
-            : "Unknown";
+        let quality = "Unknown";
+        if (metadata.resolution) {
+          const parts = metadata.resolution.split("x");
+          const width = parseInt(parts[0], 10);
+          const height = parseInt(parts[1], 10);
+          if (!isNaN(width) && !isNaN(height)) {
+            quality = `${Math.min(width, height)}p`;
+          } else {
+            quality = `${parts[1] || parts[0]}p`;
+          }
+        } else if (metadata.bandwidth) {
+          quality = `${Math.round(metadata.bandwidth / 1000)}k`;
+        }
 
         streams.push({
           quality: quality,
