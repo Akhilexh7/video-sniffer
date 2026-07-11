@@ -5,20 +5,21 @@
  * @param {string} m3u8Url The URL of the manifest file
  * @returns {Promise<Array<{quality: string, url: string}>>}
  */
-async function fetchText(url, tabId) {
+async function fetchText(url, tabId, frameId = null) {
   if (tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
     try {
       return await new Promise((resolve, reject) => {
         chrome.runtime.sendMessage({
           action: "background_proxy_fetch",
           tabId: tabId,
+          frameId: frameId,
           url: url,
           responseType: "text"
         }, (response) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
           } else if (response && response.success) {
-            resolve(response.data);
+            resolve({ text: response.data, finalUrl: response.responseUrl || url });
           } else {
             reject(new Error(response ? response.error : "Failed proxy fetch"));
           }
@@ -33,12 +34,16 @@ async function fetchText(url, tabId) {
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${response.statusText}`);
   }
-  return await response.text();
+  const text = await response.text();
+  return { text, finalUrl: response.url || url };
 }
 
-export async function parseM3U8(m3u8Url, tabId = null) {
+export async function parseM3U8(m3u8Url, tabId = null, frameId = null) {
   console.log(`[Parser] Fetching manifest: ${m3u8Url} for tab: ${tabId}`);
-  const text = await fetchText(m3u8Url, tabId);
+  const res = await fetchText(m3u8Url, tabId, frameId);
+  const text = res.text;
+  const finalUrl = res.finalUrl;
+  
   if (!text.startsWith("#EXTM3U")) {
     throw new Error("Invalid M3U8 playlist format");
   }
@@ -61,7 +66,7 @@ export async function parseM3U8(m3u8Url, tabId = null) {
           language: media.LANGUAGE || "",
           default: media.DEFAULT === "YES",
           autoselect: media.AUTOSELECT === "YES",
-          url: resolveUrl(m3u8Url, media.URI)
+          url: resolveUrl(finalUrl, media.URI)
         });
       }
       continue;
@@ -83,7 +88,7 @@ export async function parseM3U8(m3u8Url, tabId = null) {
       }
 
       if (urlLine) {
-        const fullUrl = resolveUrl(m3u8Url, urlLine);
+        const fullUrl = resolveUrl(finalUrl, urlLine);
         const quality = metadata.resolution 
           ? `${metadata.resolution.split("x")[1]}p` 
           : metadata.bandwidth 
@@ -160,8 +165,10 @@ function selectDefaultAudioRendition(renditions) {
   return renditions.find((rendition) => rendition.default) || renditions[0] || null;
 }
 
-// Resolves relative URLs based on manifest base URL
 function resolveUrl(baseUrl, relativeUrl) {
+  if (relativeUrl.startsWith("http://") || relativeUrl.startsWith("https://")) {
+    return relativeUrl;
+  }
   try {
     const baseObj = new URL(baseUrl);
     const resolvedObj = new URL(relativeUrl, baseUrl);
@@ -178,11 +185,6 @@ function resolveUrl(baseUrl, relativeUrl) {
     }
     return resolvedObj.href;
   } catch (e) {
-    // Fallback if URL constructor fails
-    if (relativeUrl.startsWith("http://") || relativeUrl.startsWith("https://")) {
-      return relativeUrl;
-    }
-    
     const baseParts = baseUrl.split("/");
     baseParts.pop(); // remove filename
     

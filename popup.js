@@ -97,6 +97,7 @@ function getSortableSizeBytes(video) {
 
 // Renders HLS streams at the top and direct media links below
 function renderVideoCards(videos) {
+  console.log("[Popup] renderVideoCards called. Videos:", videos);
   videoList.innerHTML = "";
   showState("detected");
 
@@ -105,12 +106,23 @@ function renderVideoCards(videos) {
     card.className = "video-card";
     const previewMarkup = createPreviewMarkup(video);
     
-    if (video.type === "hls") {
+    if (video.type === "hls" || video.type === "youtube") {
+      const displayTitle = video.type === "youtube" ? (video.pageTitle || video.title || "YouTube Video") : (video.pageTitle || "HLS Video Stream");
+      const badgeClass = video.type.toLowerCase();
+      const badgeText = video.type === "youtube" ? "YouTube" : "HLS";
+      const errorIndicator = video.parseError 
+        ? `<div style="font-size: 10px; color: #ef4444; margin-top: 2px; font-weight: 500;">⚠️ Parse failed: ${video.parseError}</div>`
+        : "";
+      
       card.innerHTML = `
         <div class="video-info">
           ${previewMarkup}
           <div class="video-meta">
-            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--accent-primary);">${video.pageTitle || "HLS Video Stream"}</div>
+            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--accent-primary);">${displayTitle}</div>
+            <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
+              <span class="video-type-badge ${badgeClass}">${badgeText}</span> <span style="vertical-align: middle;">Multi-Quality Stream</span>
+            </div>
+            ${errorIndicator}
           </div>
         </div>
         <button class="btn btn-primary download-action-btn">
@@ -119,16 +131,16 @@ function renderVideoCards(videos) {
       `;
 
       card.querySelector(".download-action-btn").addEventListener("click", () => {
-        handleHlsCardClick(video);
+        handleMultiQualityCardClick(video);
       });
       card.addEventListener("click", (e) => {
         if (!e.target.classList.contains("download-action-btn")) {
-          handleHlsCardClick(video);
+          handleMultiQualityCardClick(video);
         }
       });
     } else {
       const sizeText = getCardSizeText(video);
-      const ext = video.type.toUpperCase();
+      const ext = video.type.toLowerCase();
       const res = video.resolution !== "Detected" ? video.resolution : "Direct";
       
       let displayTitle = getFilenameFromUrl(video.url);
@@ -137,7 +149,7 @@ function renderVideoCards(videos) {
         displayTitle = `${video.pageTitle} (${res})`;
       }
       
-      const downloadText = isYoutube ? `Download (${ext})` : `Download ${ext}`;
+      const downloadText = isYoutube ? `Download (${ext.toUpperCase()})` : `Download ${ext.toUpperCase()}`;
       
       card.innerHTML = `
         <div class="video-info">
@@ -145,7 +157,7 @@ function renderVideoCards(videos) {
           <div class="video-meta">
             <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
             <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
-              ${isYoutube ? "YouTube Stream | " : ""}<span class="video-size">${sizeText}</span>
+              <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeText}</span>
             </div>
           </div>
         </div>
@@ -331,24 +343,57 @@ function estimateSizeText(bandwidth, duration) {
 }
 
 // Opens the quality picker modal, queries video duration from content script, and lists HLS qualities with sizes
-async function handleHlsCardClick(video) {
+// Opens the quality picker modal, queries video duration from content script, and lists HLS or YouTube qualities
+async function handleMultiQualityCardClick(video) {
   try {
-    console.log("[Popup] Querying active video duration for size estimation...");
     qualityDialog.classList.remove("hidden");
     qualityOptions.innerHTML = "<div class='state-desc' style='padding: 20px 0; text-align: center;'>Parsing qualities...</div>";
 
+    if (video.type === "youtube") {
+      qualityOptions.innerHTML = "";
+      if (video.qualities && video.qualities.length > 0) {
+        video.qualities.forEach((q) => {
+          createModalOptionButton(
+            q.isProgressive ? `${q.resolution}` : `${q.resolution} [Adaptive Mux]`, 
+            q.container.toUpperCase(), 
+            "", 
+            () => {
+              qualityDialog.classList.add("hidden");
+              if (q.isProgressive || !q.audioUrl) {
+                chrome.runtime.sendMessage({
+                  action: "start_direct_download",
+                  tabId: activeTabId,
+                  url: q.videoUrl,
+                  pageTitle: video.pageTitle || video.title || "YouTube Video",
+                  expectedSize: q.sizeBytes || null,
+                  frameId: video.frameId || null
+                });
+                showDownloadProgress(0);
+              } else {
+                startYoutubeDownload(q.videoUrl, q.audioUrl, video.pageTitle || video.title || "YouTube Video", q.resolution, video.frameId || null);
+              }
+            }
+          );
+        });
+      } else {
+        qualityOptions.innerHTML = "<div class='state-desc' style='padding: 20px 0; text-align: center;'>No qualities available yet. Try playing the video.</div>";
+      }
+      return;
+    }
+
+    console.log("[Popup] Querying active video duration for size estimation...");
     // Query active video duration from content script context
     chrome.tabs.sendMessage(activeTabId, { action: "get_video_duration" }, async (response) => {
       const duration = (response && response.duration) ? response.duration : 0;
       
       try {
-        const qualities = await parseM3U8(video.url, activeTabId);
+        const qualities = await parseM3U8(video.url, activeTabId, video.frameId);
         
         if (qualities.length === 0) {
           qualityOptions.innerHTML = "";
           createModalOptionButton("Auto Quality", "Auto", "", () => {
             qualityDialog.classList.add("hidden");
-            startHlsDownload(video.url, "Auto");
+            startHlsDownload(video.url, "Auto", video.frameId || null);
           });
         } else {
           // Sort HLS quality list in descending order (highest resolution first)
@@ -363,26 +408,26 @@ async function handleHlsCardClick(video) {
             const sizeText = estimateSizeText(q.bandwidth, duration);
             createModalOptionButton(q.quality, q.resolution, sizeText, () => {
               qualityDialog.classList.add("hidden");
-              startHlsDownload(video.url, q.quality);
+              startHlsDownload(video.url, q.quality, video.frameId || null);
             });
           });
         }
       } catch (err) {
         console.error("[Popup] HLS manifest parse failed inside content callback:", err);
-        fallbackHlsDownload(video.url);
+        fallbackHlsDownload(video);
       }
     });
   } catch (e) {
-    console.error("[Popup] HLS card click failed:", e);
-    fallbackHlsDownload(video.url);
+    console.error("[Popup] Multi quality card click failed:", e);
+    fallbackHlsDownload(video);
   }
 }
 
-function fallbackHlsDownload(url) {
+function fallbackHlsDownload(video) {
   qualityOptions.innerHTML = "";
   createModalOptionButton("Auto Quality", "Auto", "", () => {
     qualityDialog.classList.add("hidden");
-    startHlsDownload(url, "Auto");
+    startHlsDownload(video.url, "Auto", video.frameId || null);
   });
 }
 
@@ -403,12 +448,26 @@ function createModalOptionButton(qualityTitle, resolution, estimatedSize, onClic
   qualityOptions.appendChild(btn);
 }
 
-function startHlsDownload(m3u8Url, qualityTitle) {
+function startHlsDownload(m3u8Url, qualityTitle, frameId) {
   chrome.runtime.sendMessage({
     action: "start_hls_download",
     tabId: activeTabId,
     url: m3u8Url,
-    qualityTitle: qualityTitle
+    qualityTitle: qualityTitle,
+    frameId: frameId
+  });
+  showDownloadProgress(0);
+}
+
+function startYoutubeDownload(videoUrl, audioUrl, pageTitle, resolution, frameId) {
+  chrome.runtime.sendMessage({
+    action: "start_youtube_download",
+    tabId: activeTabId,
+    videoUrl: videoUrl,
+    audioUrl: audioUrl,
+    pageTitle: pageTitle,
+    resolution: resolution,
+    frameId: frameId
   });
   showDownloadProgress(0);
 }
@@ -419,7 +478,8 @@ function startCombinedMediaDownload(video) {
     tabId: activeTabId,
     videoUrl: video.url,
     audioUrl: video.audioUrl,
-    pageTitle: video.pageTitle || getFilenameFromUrl(video.url)
+    pageTitle: video.pageTitle || getFilenameFromUrl(video.url),
+    frameId: video.frameId || null
   });
   showDownloadProgress(0);
 }
@@ -429,7 +489,9 @@ function startDirectDownload(video) {
     action: "start_direct_download",
     tabId: activeTabId,
     url: video.url,
-    pageTitle: video.pageTitle || getFilenameFromUrl(video.url)
+    pageTitle: video.pageTitle || getFilenameFromUrl(video.url),
+    expectedSize: video.sizeBytes || null,
+    frameId: video.frameId || null
   });
   showDownloadProgress(0);
 }
@@ -485,7 +547,7 @@ function hideDownloadProgress() {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.tabId !== activeTabId) return;
 
-  if (message.action === "video_registry_cleared") {
+  if (message.action === "video_registry_cleared" || message.action === "video_registry_updated") {
     refreshVideoList();
   } else if (message.action === "download_progress_update") {
     showDownloadProgress(message.progress);

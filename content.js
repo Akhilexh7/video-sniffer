@@ -103,6 +103,9 @@ function reportVideo(url, source, thumbnail, trackHints = {}, mediaExtras = {}) 
   // Ignore Blob URLs since background.js catches their underlying network requests (HLS/DASH/MP4)
   if (url.startsWith("blob:")) return;
 
+  // Ignore DOM/markup scans on YouTube host to let native main-world sniffer register formats
+  if (window.location.hostname.includes("youtube.com")) return;
+
   const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
   let type = null;
   let title = "";
@@ -713,98 +716,15 @@ function cleanMediaUrl(url) {
 }
 
 // --- YouTube Sniffer Logic ---
-function injectMainWorldScript() {
-  const scriptStr = `
-    (function() {
-      if (window.__youtube_sniffer_injected__) return;
-      window.__youtube_sniffer_injected__ = true;
-
-      console.log("[YouTube Sniffer] Main world script injected.");
-
-      function checkAndPostPlayerResponse() {
-        const player = document.getElementById("movie_player");
-        if (player && typeof player.getPlayerResponse === "function") {
-          const response = player.getPlayerResponse();
-          if (response) {
-            window.postMessage({
-              type: "YOUTUBE_PLAYER_RESPONSE",
-              response: response,
-              title: document.title
-            }, "*");
-          }
-        } else if (window.ytInitialPlayerResponse) {
-          window.postMessage({
-            type: "YOUTUBE_PLAYER_RESPONSE",
-            response: window.ytInitialPlayerResponse,
-            title: document.title
-          }, "*");
-        }
-      }
-
-      // Check immediately
-      checkAndPostPlayerResponse();
-
-      // Check on player state changes or page navigations
-      document.addEventListener("yt-navigate-finish", () => {
-        setTimeout(checkAndPostPlayerResponse, 500);
-      });
-      document.addEventListener("yt-page-data-updated", () => {
-        setTimeout(checkAndPostPlayerResponse, 500);
-      });
-
-      // Intercept dynamic XHR/fetch player responses
-      const originalFetch = window.fetch;
-      window.fetch = async function(...args) {
-        const response = await originalFetch.apply(this, args);
-        const url = args[0];
-        if (typeof url === 'string' && url.includes('/youtubei/v1/player')) {
-          try {
-            const clone = response.clone();
-            const json = await clone.json();
-            window.postMessage({ type: 'YOUTUBE_PLAYER_RESPONSE', response: json, title: document.title }, '*');
-          } catch (e) {}
-        }
-        return response;
-      };
-
-      const originalOpen = XMLHttpRequest.prototype.open;
-      const originalSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(method, url) {
-        this._url = url;
-        return originalOpen.apply(this, arguments);
-      };
-      XMLHttpRequest.prototype.send = function() {
-        this.addEventListener('load', function() {
-          if (this._url && this._url.includes('/youtubei/v1/player')) {
-            try {
-              const json = JSON.parse(this.responseText);
-              window.postMessage({ type: 'YOUTUBE_PLAYER_RESPONSE', response: json, title: document.title }, '*');
-            } catch (e) {}
-          }
-        });
-        return originalSend.apply(this, arguments);
-      };
-
-      // Periodic fallback check (e.g. for SPA transition edge cases)
-      let lastUrl = window.location.href;
-      setInterval(() => {
-        if (window.location.href !== lastUrl) {
-          lastUrl = window.location.href;
-          setTimeout(checkAndPostPlayerResponse, 1000);
-        }
-      }, 1000);
-    })();
-  `;
-
-  const script = document.createElement("script");
-  script.textContent = scriptStr;
-  (document.head || document.documentElement).appendChild(script);
-  script.remove();
-}
+// YouTube sniffer is executed via youtube-main.js in the MAIN world, configured in manifest.json.
 
 function handleYouTubeResponse(response, pageTitle) {
+  console.log("[YouTube Content] handleYouTubeResponse called. Page title:", pageTitle);
   const streamingData = response.streamingData;
-  if (!streamingData) return;
+  if (!streamingData) {
+    console.log("[YouTube Content] No streamingData found in player response.");
+    return;
+  }
 
   // Extract thumbnail
   let thumbnail = null;
@@ -818,32 +738,73 @@ function handleYouTubeResponse(response, pageTitle) {
     thumbnail = `https://img.youtube.com/vi/${response.videoDetails.videoId}/mqdefault.jpg`;
   }
 
+  const title = (response.videoDetails && response.videoDetails.title) ? response.videoDetails.title : pageTitle;
+  const videoId = (response.videoDetails && response.videoDetails.videoId) ? response.videoDetails.videoId : null;
+
   const formats = [];
   if (streamingData.formats) {
-    formats.push(...streamingData.formats);
+    streamingData.formats.forEach(f => {
+      f.isProgressive = true;
+      formats.push(f);
+    });
+  }
+  if (streamingData.adaptiveFormats) {
+    streamingData.adaptiveFormats.forEach(f => {
+      f.isProgressive = false;
+      formats.push(f);
+    });
   }
 
-  // Adaptive formats are separate audio or video tracks on YouTube.
-  // This extension does not mux them yet, so only expose complete formats.
+  console.log(`[YouTube Content] Found ${formats.length} formats total.`);
+
+  let directCount = 0;
+  let sentCount = 0;
 
   formats.forEach((format) => {
-    // Only report direct URLs (no signatureCipher here, those are handled via network interception in background.js)
+    // Log for Bug #3
+    console.log(
+      "itag",
+      format.itag,
+      "url?",
+      !!format.url,
+      "cipher?",
+      !!format.signatureCipher,
+      "cipher2?",
+      !!format.cipher
+    );
+
     if (format.url) {
+      directCount++;
+      const mime = format.mimeType || "";
+      const isVideo = format.isProgressive || mime.startsWith("video/");
+      const isAudio = format.isProgressive || mime.startsWith("audio/");
+      const container = (mime.includes("webm") || mime.includes("vp9") || mime.includes("opus")) ? "webm" : "mp4";
+      const resolution = format.qualityLabel || (format.bitrate ? `${Math.round(format.bitrate / 1000)}kbps` : "Audio");
+
+      sentCount++;
+      console.log(`[YouTube Content] Sending register_youtube_format for itag ${format.itag} (${resolution}, ${container})`);
       chrome.runtime.sendMessage({
-        action: "register_detected_video",
-        video: {
+        action: "register_youtube_format",
+        format: {
           url: format.url,
-          type: "youtube_stream",
-          quality: "YouTube",
-          resolution: "Detect",
-          title: "YouTube Video",
-          pageTitle: pageTitle,
           itag: format.itag,
-          thumbnail: thumbnail
+          videoId: videoId,
+          title: title,
+          thumbnail: thumbnail,
+          hasVideo: isVideo,
+          hasAudio: isAudio,
+          resolution: resolution,
+          container: container
         }
       }).catch(() => {});
     }
   });
+
+  console.log("StreamingData:", !!streamingData);
+  console.log("Formats:", streamingData.formats?.length || 0);
+  console.log("Adaptive:", streamingData.adaptiveFormats?.length || 0);
+  console.log("Direct URLs:", directCount);
+  console.log("Messages sent:", sentCount);
 }
 
 // Set up listeners for messages from main world
@@ -856,10 +817,7 @@ window.addEventListener("message", (event) => {
   }
 });
 
-// Run YouTube sniffer if on YouTube
-if (window.location.hostname.includes("youtube.com")) {
-  injectMainWorldScript();
-}
+// Native sniffer script handles YOUTUBE_PLAYER_RESPONSE posting.
 
 // Listener for proxy fetches from the extension background/offscreen contexts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -877,6 +835,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
+
+        const headers = {};
+        response.headers.forEach((val, key) => {
+          const lKey = key.toLowerCase();
+          if (["content-length", "content-range", "content-type", "accept-ranges"].includes(lKey)) {
+            headers[lKey] = val;
+          }
+        });
         
         if (responseType === "arraybuffer") {
           const buffer = await response.arrayBuffer();
@@ -890,16 +856,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({
             success: true,
             status: response.status,
+            headers: headers,
             data: base64,
-            responseType: "base64"
+            responseType: "base64",
+            responseUrl: response.url
           });
         } else {
           const text = await response.text();
           sendResponse({
             success: true,
             status: response.status,
+            headers: headers,
             data: text,
-            responseType: "text"
+            responseType: "text",
+            responseUrl: response.url
           });
         }
       })

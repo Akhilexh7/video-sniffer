@@ -569,3 +569,19 @@ body {
 .banner-cancel-btn:hover {
   background: rgba(239, 68, 68, 0.2);
 }
+
+.video-type-badge.youtube {
+  background-color: #ef4444;
+}
+.video-type-badge.hls {
+  background-color: #a855f7;
+}
+.video-type-badge.dash {
+  background-color: #f59e0b;
+}
+.video-type-badge.mp4 {
+  background-color: #10b981;
+}
+.video-type-badge.webm {
+  background-color: #3b82f6;
+}

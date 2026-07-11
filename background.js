@@ -129,7 +129,18 @@ async function registerDnrRulesForDownload(tabId, pageUrl) {
       removeRuleIds: [tabId],
       addRules: rules
     });
-    console.log(`[DNR] Registered headers rules for Tab ${tabId}. Referer: ${pageUrl}, Origin: ${origin}`);
+    
+    // Verify it actually stuck
+    const active = await chrome.declarativeNetRequest.getSessionRules();
+    const confirmed = active.some(r => r.id === tabId);
+    if (!confirmed) {
+      console.warn(`[DNR] Rule for tab ${tabId} did not confirm active, retrying once...`);
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [tabId],
+        addRules: rules
+      });
+    }
+    console.log(`[DNR] Registered and confirmed headers rules for Tab ${tabId}. Referer: ${pageUrl}, Origin: ${origin}`);
   } catch (e) {
     console.error("[DNR] Failed to register declarativeNetRequest rules:", e);
   }
@@ -147,6 +158,148 @@ async function unregisterDnrRulesForDownload(tabId) {
   }
 }
 
+const tabYoutubeMediaState = {};
+
+function processYoutubeMedia(tabId, item, pageTitle) {
+  console.log(`[Background] processYoutubeMedia called for tab ${tabId}. itag: ${item.itag}, videoId: ${item.videoId}, url: ${item.url ? item.url.substring(0, 120) : "none"}`);
+  
+  if (!tabYoutubeMediaState[tabId] || (item.videoId && tabYoutubeMediaState[tabId].videoId !== item.videoId)) {
+    console.log(`[Background] New YouTube video detected (videoId: ${item.videoId}). Resetting media state for Tab ${tabId}.`);
+    if (tabVideoRegistry[tabId]) {
+      tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v.type !== "youtube");
+    }
+    tabYoutubeMediaState[tabId] = {
+      videoId: item.videoId || null,
+      title: pageTitle || "YouTube Video",
+      thumbnail: item.thumbnail || null,
+      videoUrls: {},
+      audioUrls: {}
+    };
+  }
+
+  const state = tabYoutubeMediaState[tabId];
+  if (item.title && (!state.title || state.title === "YouTube Video")) state.title = item.title;
+  if (item.thumbnail && !state.thumbnail) state.thumbnail = item.thumbnail;
+
+  const itag = Number(item.itag);
+  let isVideo = item.hasVideo;
+  let isAudio = item.hasAudio;
+  let resolution = item.resolution;
+  let container = item.container;
+
+  // Fallback to YOUTUBE_ITAGS if properties are not directly provided (e.g. from network interception)
+  if (typeof isVideo === "undefined" || typeof isAudio === "undefined") {
+    const itagInfo = YOUTUBE_ITAGS[itag];
+    if (itagInfo) {
+      isVideo = itagInfo.hasVideo;
+      isAudio = itagInfo.hasAudio;
+      resolution = itagInfo.resolution;
+      container = itagInfo.type;
+    } else {
+      console.log(`[Background] Unknown YouTube itag without metadata: ${itag}`);
+      return;
+    }
+  }
+
+  const isProgressive = isVideo && isAudio;
+
+  if (isProgressive) {
+    state.videoUrls[itag] = { url: cleanYoutubeUrl(item.url), resolution, container, isProgressive: true };
+    console.log(`[Background] Registered progressive video itag ${itag} for tab ${tabId}. Total video urls:`, Object.keys(state.videoUrls));
+  } else if (isVideo && !isAudio) {
+    state.videoUrls[itag] = { url: cleanYoutubeUrl(item.url), resolution, container, isProgressive: false };
+    console.log(`[Background] Registered video itag ${itag} for tab ${tabId}. Total video urls:`, Object.keys(state.videoUrls));
+  } else if (isAudio && !isVideo) {
+    state.audioUrls[itag] = { url: cleanYoutubeUrl(item.url), resolution, container };
+    console.log(`[Background] Registered audio itag ${itag} for tab ${tabId}. Total audio urls:`, Object.keys(state.audioUrls));
+  }
+
+  // Log counts for Bug #4
+  console.log(`[Background] Videos total: ${Object.keys(state.videoUrls).length}`);
+  console.log(`[Background] Audios total: ${Object.keys(state.audioUrls).length}`);
+
+  // Re-evaluate pairings
+  const pairedQualities = [];
+  Object.keys(state.videoUrls).forEach((videoItagStr) => {
+    const videoItag = Number(videoItagStr);
+    const videoObj = state.videoUrls[videoItag];
+
+    if (videoObj.isProgressive) {
+      pairedQualities.push({
+        resolution: videoObj.resolution,
+        videoUrl: videoObj.url,
+        audioUrl: null,
+        container: videoObj.container,
+        videoItag: videoItag,
+        audioItag: null,
+        isProgressive: true
+      });
+      return;
+    }
+
+    const isWebmVideo = videoObj.container === "webm";
+    let audioUrl = null;
+    let bestAudioItag = null;
+    let bestAudioBitrate = 0;
+
+    Object.keys(state.audioUrls).forEach((audioItagStr) => {
+      const audioItag = Number(audioItagStr);
+      const audioObj = state.audioUrls[audioItag];
+      const isWebmAudio = audioObj.container === "webm";
+      if (isWebmVideo !== isWebmAudio) return;
+
+      const bitrate = parseInt(audioObj.resolution) || (audioItag === 140 || audioItag === 251 || audioItag === 171 ? 128 : 50);
+      if (bitrate > bestAudioBitrate) {
+        bestAudioBitrate = bitrate;
+        audioUrl = audioObj.url;
+        bestAudioItag = audioItag;
+      }
+    });
+
+    if (!audioUrl) {
+      const firstAudioItag = Object.keys(state.audioUrls)[0];
+      if (firstAudioItag) {
+        audioUrl = state.audioUrls[firstAudioItag].url;
+        bestAudioItag = Number(firstAudioItag);
+      }
+    }
+
+    if (audioUrl) {
+      pairedQualities.push({
+        resolution: videoObj.resolution,
+        videoUrl: videoObj.url,
+        audioUrl: audioUrl,
+        container: videoObj.container,
+        videoItag: videoItag,
+        audioItag: bestAudioItag,
+        isProgressive: false
+      });
+    }
+  });
+
+  console.log(`[Background] Pairing summary for tab ${tabId}. Paired count: ${pairedQualities.length}`);
+
+  if (pairedQualities.length > 0) {
+    pairedQualities.sort((a, b) => {
+      const resA = parseInt(a.resolution) || 0;
+      const resB = parseInt(b.resolution) || 0;
+      return resB - resA;
+    });
+
+    console.log(`[Background] Registering unified YouTube card for tab ${tabId} with ${pairedQualities.length} qualities.`);
+    registerVideo(tabId, {
+      url: "youtube://multi",
+      type: "youtube",
+      quality: "YouTube",
+      resolution: "Multi Quality",
+      title: state.title,
+      thumbnail: state.thumbnail,
+      qualities: pairedQualities,
+      pageTitle: state.title
+    });
+  }
+}
+
 // 1. Network Interception via webRequest API (equivalent to shouldInterceptRequest in Android)
 // Inspects response headers to confirm content types while ignoring HTML pages and HLS .ts segments
 chrome.webRequest.onHeadersReceived.addListener(
@@ -154,35 +307,36 @@ chrome.webRequest.onHeadersReceived.addListener(
     const { url, tabId, type, responseHeaders, statusCode } = details;
     if (tabId < 0) return;
 
-    // Intercept YouTube streams before other content type checks
-    if (url.includes("googlevideo.com/videoplayback") || url.includes("youtube.com/videoplayback")) {
-      try {
-        const urlObj = new URL(url);
-        const itagStr = urlObj.searchParams.get("itag");
-        if (itagStr) {
-          const itag = parseInt(itagStr);
-          const itagInfo = YOUTUBE_ITAGS[itag];
-          if (itagInfo) {
-            if (!itagInfo.hasAudio || !itagInfo.hasVideo) {
-              console.log(`[Detector] Ignoring YouTube adaptive stream without both audio and video. itag=${itag}`);
-              return;
-            }
-            registerVideo(tabId, {
-              url: url,
-              type: "youtube_stream",
-              quality: "YouTube",
-              resolution: itagInfo.resolution,
-              title: itagInfo.title,
-              itag: itag,
-              hasAudio: itagInfo.hasAudio,
-              hasVideo: itagInfo.hasVideo
+    // Intercept YouTube streams and prevent them from falling through to generic detection
+    if (url.includes("googlevideo.com") || url.includes("youtube.com")) {
+      if (url.includes("/videoplayback")) {
+        try {
+          const urlObj = new URL(url);
+          const itagStr = urlObj.searchParams.get("itag");
+          if (itagStr) {
+            const itag = parseInt(itagStr);
+            console.log(`[Background Network] Intercepted googlevideo playback request. itag: ${itag}`);
+            chrome.tabs.get(tabId, (tab) => {
+              let title = "YouTube Video";
+              let favIconUrl = null;
+              if (chrome.runtime.lastError || !tab) {
+                console.warn("[Background Network] Failed to get tab info for tabId:", tabId, "using fallbacks.");
+              } else {
+                title = tab.title || "YouTube Video";
+                favIconUrl = tab.favIconUrl || null;
+              }
+              processYoutubeMedia(tabId, {
+                url: url,
+                itag: itag,
+                thumbnail: favIconUrl
+              }, title);
             });
-            return;
           }
+        } catch (e) {
+          console.error("[Detector] Error intercepting YouTube stream:", e);
         }
-      } catch (e) {
-        console.error("[Detector] Error intercepting YouTube stream:", e);
       }
+      return; // Always return early for YouTube/googlevideo URLs to bypass generic detectors
     }
 
     // Filter out navigation frames (which represent HTML pages)
@@ -377,6 +531,7 @@ function parseContentRange(value) {
 
 function isPlayableDetectedVideo(video) {
   if (!video) return false;
+  if (video.type === "youtube") return true;
   if (video.type === "hls") return true;
   if (video.hasVideo === false) return false;
   if (video.hasAudio === false && !video.audioUrl) return false;
@@ -390,11 +545,21 @@ function registerVideo(tabId, video) {
     tabVideoRegistry[tabId] = [];
   }
 
+  if (video.type === "youtube") {
+    const idx = tabVideoRegistry[tabId].findIndex(v => v.type === "youtube");
+    if (idx !== -1) {
+      tabVideoRegistry[tabId][idx] = video;
+    } else {
+      tabVideoRegistry[tabId].push(video);
+    }
+    updateBadgeCount(tabId);
+    chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+    return;
+  }
+
   if (video.url && video.type !== "hls" && video.type !== "dash" && !video.url.includes("cdninstagram.com")) {
     video.url = normalizeRangedMediaUrl(video.url);
   }
-
-
 
   const isYoutube = (video.url && (video.url.includes("googlevideo.com/videoplayback") || video.url.includes("youtube.com/videoplayback"))) || video.type === "youtube_stream" || video.itag;
   const isManifest = video.type === "hls" || video.type === "dash" || (video.url && (video.url.includes(".m3u8") || video.url.includes(".mpd")));
@@ -427,10 +592,18 @@ function registerVideo(tabId, video) {
 
     if (!exists) {
       chrome.tabs.get(tabId, async (tab) => {
-        if (chrome.runtime.lastError || !tab) return;
+        let tabUrl = null;
+        let tabTitle = "Video Stream";
+        if (chrome.runtime.lastError || !tab) {
+          console.warn("[Detector] Failed to get tab info during registerVideo for tabId:", tabId, "using fallbacks.");
+        } else {
+          tabUrl = tab.url;
+          tabTitle = tab.title || "Video Stream";
+        }
         
-        if (tab.url) {
-          await registerDnrRulesForDownload(tabId, tab.url);
+        const ruleUrl = video.frameUrl || tabUrl;
+        if (ruleUrl) {
+          await registerDnrRulesForDownload(tabId, ruleUrl);
         }
         
         // If it's YouTube, normalize properties using YOUTUBE_ITAGS
@@ -458,21 +631,22 @@ function registerVideo(tabId, video) {
           }
         }
 
-        video.pageTitle = tab.title || "Video Stream";
+        video.pageTitle = tabTitle;
         
         // Fetch HLS qualities in background immediately to calculate options count
         if (video.type === "hls") {
           try {
             console.log("[Detector] Parsing HLS qualities in background...");
-            const qualities = await parseM3U8(video.url);
+            const qualities = await parseM3U8(video.url, tabId, video.frameId);
             video.qualities = qualities || [];
             video.isHlsMaster = video.qualities.length > 0;
             video.hasSeparateAudio = video.qualities.some((quality) => !!quality.audioUrl);
           } catch (e) {
-            console.warn("[Detector] Failed HLS quality check in background:", e);
+            console.error(`[Detector] HLS parse failed for ${video.url}:`, e.message);
             video.qualities = [];
             video.isHlsMaster = false;
             video.hasSeparateAudio = false;
+            video.parseError = e.message;
           }
 
           if (video.isHlsMaster) {
@@ -566,12 +740,16 @@ function updateBadgeCount(tabId) {
 // 3. Handle messages from Content Script and Popup UI
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "background_proxy_fetch") {
+    const options = {};
+    if (typeof message.frameId === "number") {
+      options.frameId = message.frameId;
+    }
     chrome.tabs.sendMessage(message.tabId, {
       action: "proxy_fetch",
       url: message.url,
       options: message.options,
       responseType: message.responseType
-    }, (response) => {
+    }, options, (response) => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else {
@@ -587,14 +765,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (tabId) {
       console.log(`[Detector] Tab ${tabId} requested registry clear (reload).`);
       tabVideoRegistry[tabId] = [];
+      delete tabYoutubeMediaState[tabId];
       unregisterDnrRulesForDownload(tabId);
       chrome.action.setBadgeText({ tabId, text: "" });
       chrome.runtime.sendMessage({ action: "video_registry_cleared", tabId: tabId }).catch(() => {});
     }
     sendResponse({ success: true });
+  } else if (message.action === "register_youtube_format") {
+    console.log("[Background Message] Received register_youtube_format. Format:", message.format);
+    if (tabId) {
+      processYoutubeMedia(tabId, message.format, message.format.title);
+    }
+    sendResponse({ success: true });
   } else if (message.action === "register_detected_video") {
     // Media URL detected via DOM/MutationObserver or API hook
     if (tabId) {
+      if (sender.url) {
+        message.video.frameUrl = sender.url;
+      }
+      if (typeof sender.frameId !== "undefined") {
+        message.video.frameId = sender.frameId;
+      }
       registerVideo(tabId, message.video);
     }
   } else if (message.action === "get_detected_videos") {
@@ -611,15 +802,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
   } else if (message.action === "start_hls_download") {
     // Delegate HLS download to offscreen document
-    handleHlsDownload(message.tabId, message.url, message.qualityTitle);
+    handleHlsDownload(message.tabId, message.url, message.qualityTitle, message.frameId);
     sendResponse({ success: true });
   } else if (message.action === "start_combined_media_download") {
     // Delegate combined media download to offscreen document
-    handleCombinedMediaDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle);
+    handleCombinedMediaDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.frameId);
     sendResponse({ success: true });
   } else if (message.action === "start_direct_download") {
     // Delegate direct media download to offscreen document
-    handleDirectDownload(message.tabId, message.url, message.pageTitle);
+    handleDirectDownload(message.tabId, message.url, message.pageTitle, message.expectedSize, message.frameId);
+    sendResponse({ success: true });
+  } else if (message.action === "start_youtube_download") {
+    // Delegate YouTube video download to offscreen document
+    handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId);
     sendResponse({ success: true });
   } else if (message.action === "cancel_hls_download") {
     // Cancel download in offscreen document
@@ -650,6 +845,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Cleans up memory when tabs are closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete tabVideoRegistry[tabId];
+  delete tabYoutubeMediaState[tabId];
   unregisterDnrRulesForDownload(tabId);
   if (activeDownloads[tabId]) {
     chrome.runtime.sendMessage({
@@ -664,8 +860,23 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Clear tab registry when navigating to a new URL
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url) {
+    // If navigating within youtube.com, let the player response sniffer handle the video transition/registry reset
+    try {
+      const oldUrl = tab.url;
+      const newUrl = changeInfo.url;
+      if (oldUrl && newUrl) {
+        const oldHost = new URL(oldUrl).hostname;
+        const newHost = new URL(newUrl).hostname;
+        if (oldHost.includes("youtube.com") && newHost.includes("youtube.com")) {
+          console.log(`[Detector] Tab ${tabId} navigated within YouTube. Bypassing registry wipe.`);
+          return;
+        }
+      }
+    } catch (e) {}
+
     console.log(`[Detector] Tab ${tabId} navigated to ${changeInfo.url}. Clearing registry.`);
     tabVideoRegistry[tabId] = [];
+    delete tabYoutubeMediaState[tabId];
     unregisterDnrRulesForDownload(tabId);
     chrome.action.setBadgeText({ tabId, text: "" });
     chrome.runtime.sendMessage({ action: "video_registry_cleared", tabId: tabId }).catch(() => {});
@@ -701,7 +912,20 @@ async function closeOffscreenDocument() {
 }
 
 // Delegates sequential segment fetching to the offscreen DOM context
-async function handleHlsDownload(tabId, m3u8Url, qualityTitle) {
+function getFrameUrlForVideo(tabId, url) {
+  const registry = tabVideoRegistry[tabId] || [];
+  const getCleanUrl = (u) => u ? u.split('?')[0].split('#')[0] : '';
+  const cleanUrl = getCleanUrl(url);
+  const video = registry.find(v => {
+    if (getCleanUrl(v.url) === cleanUrl) return true;
+    if (v.qualities && v.qualities.some(q => getCleanUrl(q.url) === cleanUrl)) return true;
+    return false;
+  });
+  return video?.frameUrl || null;
+}
+
+// Delegates sequential segment fetching to the offscreen DOM context
+async function handleHlsDownload(tabId, m3u8Url, qualityTitle, frameId) {
   console.log(`[Downloader] Delegating HLS Download for tab ${tabId} to Offscreen Document.`);
   
   // Store initial download state
@@ -710,25 +934,21 @@ async function handleHlsDownload(tabId, m3u8Url, qualityTitle) {
   try {
     await setupOffscreenDocument('offscreen.html');
     
-    // Retrieve page title in background (which has chrome.tabs access) and forward it to offscreen script
-    chrome.tabs.get(tabId, async (tab) => {
-      const pageTitle = (tab && tab.title) ? tab.title : "hls_video";
-      if (tab && tab.url) {
-        await registerDnrRulesForDownload(tabId, tab.url);
-      }
-      
-      // Adding a minor timeout ensures that the DOM scripts in the offscreen page are mounted
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          action: "start_offscreen_hls_download",
-          tabId: tabId,
-          url: m3u8Url,
-          qualityTitle: qualityTitle,
-          pageTitle: pageTitle
-        }).catch((e) => {
-          console.error("[Downloader] Failed to communicate with offscreen document:", e);
-        });
-      }, 500);
+    const tab = await chrome.tabs.get(tabId);
+    const pageTitle = (tab && tab.title) ? tab.title : "hls_video";
+    
+    const frameUrl = getFrameUrlForVideo(tabId, m3u8Url) || tab?.url;
+    if (frameUrl) {
+      await registerDnrRulesForDownload(tabId, frameUrl);
+    }
+    
+    await chrome.runtime.sendMessage({
+      action: "start_offscreen_hls_download",
+      tabId: tabId,
+      url: m3u8Url,
+      qualityTitle: qualityTitle,
+      pageTitle: pageTitle,
+      frameId: frameId
     });
 
   } catch (error) {
@@ -743,7 +963,7 @@ async function handleHlsDownload(tabId, m3u8Url, qualityTitle) {
   }
 }
 
-async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle) {
+async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle, frameId) {
   console.log(`[Downloader] Delegating Combined Download for tab ${tabId} to Offscreen Document.`);
   
   activeDownloads[tabId] = { url: videoUrl, progress: 0 };
@@ -751,23 +971,21 @@ async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle)
   try {
     await setupOffscreenDocument('offscreen.html');
     
-    chrome.tabs.get(tabId, async (tab) => {
-      const title = pageTitle || ((tab && tab.title) ? tab.title : "combined_video");
-      if (tab && tab.url) {
-        await registerDnrRulesForDownload(tabId, tab.url);
-      }
-      
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          action: "start_combined_media_download",
-          tabId: tabId,
-          videoUrl: videoUrl,
-          audioUrl: audioUrl,
-          pageTitle: title
-        }).catch((e) => {
-          console.error("[Downloader] Failed to communicate with offscreen document for combined download:", e);
-        });
-      }, 500);
+    const tab = await chrome.tabs.get(tabId);
+    const title = pageTitle || ((tab && tab.title) ? tab.title : "combined_video");
+    
+    const frameUrl = getFrameUrlForVideo(tabId, videoUrl) || tab?.url;
+    if (frameUrl) {
+      await registerDnrRulesForDownload(tabId, frameUrl);
+    }
+    
+    await chrome.runtime.sendMessage({
+      action: "start_combined_media_download",
+      tabId: tabId,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      pageTitle: title,
+      frameId: frameId
     });
 
   } catch (error) {
@@ -782,7 +1000,7 @@ async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle)
   }
 }
 
-async function handleDirectDownload(tabId, url, pageTitle) {
+async function handleDirectDownload(tabId, url, pageTitle, expectedSize, frameId) {
   console.log(`[Downloader] Delegating Direct Download for tab ${tabId} to Offscreen Document.`);
   
   activeDownloads[tabId] = { url: url, progress: 0 };
@@ -790,26 +1008,63 @@ async function handleDirectDownload(tabId, url, pageTitle) {
   try {
     await setupOffscreenDocument('offscreen.html');
     
-    chrome.tabs.get(tabId, async (tab) => {
-      const title = pageTitle || ((tab && tab.title) ? tab.title : "video");
-      if (tab && tab.url) {
-        await registerDnrRulesForDownload(tabId, tab.url);
-      }
-      
-      setTimeout(() => {
-        chrome.runtime.sendMessage({
-          action: "start_offscreen_direct_download",
-          tabId: tabId,
-          url: url,
-          pageTitle: title
-        }).catch((e) => {
-          console.error("[Downloader] Failed to communicate with offscreen document for direct download:", e);
-        });
-      }, 500);
+    const tab = await chrome.tabs.get(tabId);
+    const title = pageTitle || ((tab && tab.title) ? tab.title : "video");
+    
+    const frameUrl = getFrameUrlForVideo(tabId, url) || tab?.url;
+    if (frameUrl) {
+      await registerDnrRulesForDownload(tabId, frameUrl);
+    }
+    
+    await chrome.runtime.sendMessage({
+      action: "start_offscreen_direct_download",
+      tabId: tabId,
+      url: url,
+      pageTitle: title,
+      expectedSize: expectedSize,
+      frameId: frameId
     });
 
   } catch (error) {
     console.error(`[Downloader] Direct download setup failed:`, error);
+    chrome.runtime.sendMessage({
+      action: "download_error",
+      tabId: tabId,
+      error: error.message
+    }).catch(() => {});
+    delete activeDownloads[tabId];
+    closeOffscreenDocument();
+  }
+}
+
+async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resolution, frameId) {
+  console.log(`[Downloader] Delegating YouTube Download for tab ${tabId} to Offscreen Document.`);
+  
+  activeDownloads[tabId] = { videoUrl, audioUrl, progress: 0 };
+  
+  try {
+    await setupOffscreenDocument('offscreen.html');
+    
+    const tab = await chrome.tabs.get(tabId);
+    const title = pageTitle || ((tab && tab.title) ? tab.title : "youtube_video");
+    
+    const frameUrl = getFrameUrlForVideo(tabId, videoUrl) || tab?.url;
+    if (frameUrl) {
+      await registerDnrRulesForDownload(tabId, frameUrl);
+    }
+    
+    await chrome.runtime.sendMessage({
+      action: "start_offscreen_youtube_download",
+      tabId: tabId,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      pageTitle: title,
+      resolution: resolution,
+      frameId: frameId
+    });
+
+  } catch (error) {
+    console.error(`[Downloader] YouTube download setup failed:`, error);
     chrome.runtime.sendMessage({
       action: "download_error",
       tabId: tabId,
