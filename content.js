@@ -58,21 +58,36 @@ function scanPageForVideos() {
 function handleVideoElement(video) {
   if (observedVideoElements.has(video)) return;
 
-  // Skip silent looping previews (e.g. video thumbnails on hover)
-  if (video.loop && video.muted && !video.controls) {
-    console.log("[Detector] Skipping muted looping preview video tag.");
-    return;
-  }
+  const checkAndReport = () => {
+    const isInsta = isInstagramHost();
 
-  // Skip tiny preview cards or ad players (width/height under 200px)
-  if (video.offsetWidth > 0 && video.offsetWidth < 200) {
-    console.log("[Detector] Skipping small preview thumbnail video tag.");
-    return;
-  }
+    // Skip silent looping previews (e.g. video thumbnails on hover), except on Instagram
+    if (!isInsta && video.loop && video.muted && !video.controls) {
+      console.log("[Detector] Skipping muted looping preview video tag.");
+      return;
+    }
 
-  if (video.src) {
-    reportVideoFromElement(video, "video", video.poster);
-  }
+    // Skip tiny preview cards or ad players (width/height under 200px)
+    if (video.offsetWidth > 0 && video.offsetWidth < 200) {
+      console.log("[Detector] Skipping small preview thumbnail video tag.");
+      return;
+    }
+
+    // Skip short previews (under 8 seconds duration), except on Instagram
+    if (!isInsta && video.duration && video.duration < 8) {
+      console.log("[Detector] Skipping likely preview (duration < 8s).");
+      return;
+    }
+
+    if (video.src) {
+      reportVideoFromElement(video, "video", video.poster);
+    }
+  };
+
+  checkAndReport();
+
+  video.addEventListener("loadedmetadata", checkAndReport);
+  video.addEventListener("durationchange", checkAndReport);
 
   observedVideoElements.add(video);
 
@@ -80,11 +95,7 @@ function handleVideoElement(video) {
   const observer = new MutationObserver((mutations) => {
     mutations.forEach((mutation) => {
       if (mutation.attributeName === "src" && video.src) {
-        // Re-evaluate filters on dynamic src load
-        if (video.loop && video.muted && !video.controls) return;
-        if (video.offsetWidth > 0 && video.offsetWidth < 200) return;
-        
-        reportVideoFromElement(video, "video_changed", video.poster);
+        checkAndReport();
       }
     });
   });
@@ -107,6 +118,51 @@ function reportVideo(url, source, thumbnail, trackHints = {}, mediaExtras = {}) 
   if (window.location.hostname.includes("youtube.com")) return;
 
   const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
+  
+  let instagramDescription = null;
+  if (window.location.hostname.includes("instagram.com")) {
+    try {
+      const ogDesc = document.querySelector('meta[property="og:description"]');
+      const descMeta = document.querySelector('meta[name="description"]');
+      const ogTitle = document.querySelector('meta[property="og:title"]');
+      
+      let rawDesc = "";
+      if (ogDesc && ogDesc.content) {
+        rawDesc = ogDesc.content;
+      } else if (descMeta && descMeta.content) {
+        rawDesc = descMeta.content;
+      } else if (ogTitle && ogTitle.content) {
+        rawDesc = ogTitle.content;
+      }
+      
+      if (rawDesc) {
+        const quoteMatch = rawDesc.match(/:\s*['"](.+?)['"](?:\s*|$)/s);
+        if (quoteMatch && quoteMatch[1]) {
+          instagramDescription = quoteMatch[1];
+        } else {
+          const onInstaIdx = rawDesc.indexOf("on Instagram:");
+          if (onInstaIdx !== -1) {
+            instagramDescription = rawDesc.substring(0, onInstaIdx).trim();
+          } else {
+            instagramDescription = rawDesc;
+          }
+        }
+        
+        if (instagramDescription) {
+          instagramDescription = instagramDescription
+            .replace(/[\\/*?:"<>|]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (instagramDescription.length > 96) {
+            instagramDescription = instagramDescription.substring(0, 96).trim();
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[Detector] Failed to extract Instagram description:", e);
+    }
+  }
+
   let type = null;
   let title = "";
 
@@ -163,7 +219,8 @@ function reportVideo(url, source, thumbnail, trackHints = {}, mediaExtras = {}) 
         thumbnail: thumbnail || null,
         audioUrl: mediaExtras.audioUrl || undefined,
         hasAudio: typeof trackHints.hasAudio === "boolean" ? trackHints.hasAudio : undefined,
-        hasVideo: typeof trackHints.hasVideo === "boolean" ? trackHints.hasVideo : undefined
+        hasVideo: typeof trackHints.hasVideo === "boolean" ? trackHints.hasVideo : undefined,
+        instagramDescription: instagramDescription || undefined
       }
     }).catch((err) => {
       // Suppress connection errors if background is reloading
@@ -358,6 +415,10 @@ function normalizeCandidateUrl(candidate) {
 }
 
 function scanAttributesForMediaUrls(root) {
+  if (document.querySelectorAll("video").length > 0) {
+    console.log("[Detector] Skipping attribute scan — standard DOM video already exists.");
+    return;
+  }
   const elements = root.querySelectorAll ? root.querySelectorAll("*") : [];
   elements.forEach((element) => {
     Array.from(element.attributes || []).forEach((attr) => {
@@ -370,6 +431,10 @@ function scanAttributesForMediaUrls(root) {
 }
 
 function scanPageMarkupForMediaUrls() {
+  if (document.querySelectorAll("video").length > 0) {
+    console.log("[Detector] Skipping markup scan — standard DOM video already exists.");
+    return;
+  }
   const root = document.documentElement;
   if (!root) return;
 
@@ -511,6 +576,25 @@ const pageObserver = new MutationObserver((mutations) => {
   let shouldDeepScan = false;
 
   mutations.forEach((mutation) => {
+    // Handle removed nodes to unregister DOM-sourced videos
+    if (mutation.removedNodes && mutation.removedNodes.length > 0) {
+      mutation.removedNodes.forEach((node) => {
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.tagName === "VIDEO" && node.src) {
+          chrome.runtime.sendMessage({ action: "unregister_detected_video", url: node.src }).catch(() => {});
+        } else {
+          try {
+            const childVideos = node.querySelectorAll("video");
+            childVideos.forEach((video) => {
+              if (video.src) {
+                chrome.runtime.sendMessage({ action: "unregister_detected_video", url: video.src }).catch(() => {});
+              }
+            });
+          } catch (e) {}
+        }
+      });
+    }
+
     if (mutation.type === "attributes") {
       const element = mutation.target;
       const value = element.getAttribute(mutation.attributeName);

@@ -129,10 +129,7 @@ async function handleHlsDownload(tabId, m3u8Url, qualityTitle, pageTitle, frameI
     // 3. Create Object URL (Supported here!)
     const objectUrl = URL.createObjectURL(blob);
     
-    const safeTitle = (pageTitle || "hls_video")
-      .replace(/[^a-z0-9]/gi, '_')
-      .toLowerCase()
-      .substring(0, 30);
+    const safeTitle = sanitizeFilename(pageTitle, "hls_video");
 
     console.log(`[Offscreen] Merging complete. Triggering native anchor download for: ${safeTitle}.${extension}`);
     
@@ -183,10 +180,7 @@ async function handleDirectDownload(tabId, url, pageTitle, expectedSize, frameId
     await validateDownload(blob, expectedSize);
 
     const objectUrl = URL.createObjectURL(blob);
-    const safeTitle = (pageTitle || "video")
-      .replace(/[^a-z0-9]/gi, '_')
-      .toLowerCase()
-      .substring(0, 30);
+    const safeTitle = sanitizeFilename(pageTitle, "video");
 
     console.log(`[Offscreen] Download complete. Triggering native anchor download for: ${safeTitle}.${extension}`);
     
@@ -237,10 +231,7 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
     await validateDownload(blob);
 
     const objectUrl = URL.createObjectURL(blob);
-    const safeTitle = (pageTitle || "youtube_video")
-      .replace(/[^a-z0-9]/gi, '_')
-      .toLowerCase()
-      .substring(0, 30);
+    const safeTitle = sanitizeFilename(pageTitle, "youtube_video");
 
     console.log(`[Offscreen] YouTube download and mux complete. Triggering download for: ${safeTitle}.${extension}`);
     
@@ -270,4 +261,13 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
     }).catch(() => {});
     delete activeDownloads[tabId];
   }
+}
+
+function sanitizeFilename(title, defaultName) {
+  if (!title) return defaultName;
+  let safe = title.replace(/[\\/*?:"<>|]/g, "").trim();
+  if (safe.length > 96) {
+    safe = safe.substring(0, 96).trim();
+  }
+  return safe || defaultName;
 }

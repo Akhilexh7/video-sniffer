@@ -101,7 +101,7 @@ function renderVideoCards(videos) {
   videoList.innerHTML = "";
   showState("detected");
 
-  videos.forEach((video) => {
+  const createCard = (video) => {
     const card = document.createElement("div");
     card.className = "video-card";
     const previewMarkup = createPreviewMarkup(video);
@@ -144,6 +144,9 @@ function renderVideoCards(videos) {
       const res = video.resolution !== "Detected" ? video.resolution : "Direct";
       
       let displayTitle = getFilenameFromUrl(video.url);
+      if (video.pageTitle && video.pageTitle !== "Video Stream") {
+        displayTitle = video.pageTitle;
+      }
       let isYoutube = video.url && (video.url.includes("googlevideo.com") || video.url.includes("youtube.com"));
       if (isYoutube && video.pageTitle) {
         displayTitle = `${video.pageTitle} (${res})`;
@@ -184,9 +187,70 @@ function renderVideoCards(videos) {
       });
     }
 
-    videoList.appendChild(card);
     requestVideoPreview(card, video);
+    return card;
+  };
+
+  const primaryVideos = videos.slice(0, 3);
+  const secondaryVideos = videos.slice(3);
+
+  primaryVideos.forEach((video) => {
+    videoList.appendChild(createCard(video));
   });
+
+  if (secondaryVideos.length > 0) {
+    const toggleContainer = document.createElement("div");
+    toggleContainer.className = "collapsed-videos-container";
+    toggleContainer.style.marginTop = "12px";
+    toggleContainer.style.marginBottom = "8px";
+
+    const toggleButton = document.createElement("button");
+    toggleButton.className = "btn btn-secondary";
+    toggleButton.style.display = "flex";
+    toggleButton.style.justifyContent = "center";
+    toggleButton.style.alignItems = "center";
+    toggleButton.style.gap = "6px";
+    toggleButton.innerHTML = `
+      <span>Show all (${secondaryVideos.length} more)</span>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;">
+        <polyline points="6 9 12 15 18 9"></polyline>
+      </svg>
+    `;
+
+    const collapsedContent = document.createElement("div");
+    collapsedContent.className = "collapsed-content hidden";
+    collapsedContent.style.marginTop = "10px";
+    collapsedContent.style.display = "flex";
+    collapsedContent.style.flexDirection = "column";
+    collapsedContent.style.gap = "10px";
+
+    secondaryVideos.forEach((video) => {
+      collapsedContent.appendChild(createCard(video));
+    });
+
+    toggleButton.addEventListener("click", () => {
+      const isHidden = collapsedContent.classList.contains("hidden");
+      const svg = toggleButton.querySelector("svg");
+      if (isHidden) {
+        collapsedContent.classList.remove("hidden");
+        collapsedContent.style.display = "flex";
+        toggleButton.querySelector("span").textContent = "Hide extra videos";
+        if (svg) svg.style.transform = "rotate(180deg)";
+      } else {
+        collapsedContent.classList.add("hidden");
+        collapsedContent.style.display = "none";
+        toggleButton.querySelector("span").textContent = `Show all (${secondaryVideos.length} more)`;
+        if (svg) svg.style.transform = "rotate(0deg)";
+      }
+    });
+
+    toggleContainer.appendChild(toggleButton);
+    toggleContainer.appendChild(collapsedContent);
+    videoList.appendChild(toggleContainer);
+    
+    // Ensure hidden class initially hides the content
+    collapsedContent.style.display = "none";
+  }
 }
 
 function createPreviewMarkup(video) {

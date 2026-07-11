@@ -330,6 +330,19 @@ body {
   opacity: 0.9;
 }
 
+.btn-secondary {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow);
+}
+
+.btn-secondary:hover {
+  background-color: rgba(99, 102, 241, 0.08);
+  border-color: rgba(99, 102, 241, 0.3);
+  color: var(--text-primary);
+}
+
 .btn-danger {
   background-color: var(--danger-color);
   color: #fff;
@@ -445,7 +458,6 @@ body {
   color: var(--accent-primary);
 }
 
-/* Footer */
 .app-footer {
   padding: 12px;
   background-color: var(--bg-secondary);

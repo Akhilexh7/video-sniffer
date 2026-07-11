@@ -1,5 +1,7 @@
 import { parseM3U8 } from './hls-parser.js';
 
+const MIN_DIRECT_MEDIA_SIZE = 2 * 1024 * 1024; // 2MB — filters out thumbnail previews and ad segments
+
 const YOUTUBE_ITAGS = {
   18: { resolution: "360p (MP4)", type: "mp4", title: "YouTube Video (with Audio)", hasAudio: true, hasVideo: true },
   22: { resolution: "720p (MP4)", type: "mp4", title: "YouTube Video (with Audio)", hasAudio: true, hasVideo: true },
@@ -411,8 +413,9 @@ chrome.webRequest.onHeadersReceived.addListener(
       if (contentLengthHeader && !isManifest) {
         const size = parseInt(contentLengthHeader.value);
         const comparableSize = sizeBytes || size;
-        if (!isNaN(comparableSize) && comparableSize < 512000) {
-          console.log(`[Detector] Skipping small network media (${size} bytes): ${url}`);
+        const isInstagram = url.includes("cdninstagram.com");
+        if (!isInstagram && !isNaN(comparableSize) && comparableSize < MIN_DIRECT_MEDIA_SIZE) {
+          console.log(`[Detector] Skipping small network media (${comparableSize} bytes): ${url}`);
           return;
         }
         if (!sizeBytes && !isNaN(size)) {
@@ -586,21 +589,76 @@ function registerVideo(tabId, video) {
     } else {
       const getCleanUrl = (url) => url.split('?')[0].split('#')[0];
       const videoCleanUrl = getCleanUrl(video.url);
-      existingVideo = tabVideoRegistry[tabId].find(v => getCleanUrl(v.url) === videoCleanUrl);
+      
+      const getUrlPath = (urlStr) => {
+        try {
+          const urlObj = new URL(urlStr);
+          return urlObj.pathname;
+        } catch (e) {
+          return urlStr;
+        }
+      };
+      const videoPath = getUrlPath(video.url);
+
+      const isGenericTitle = (t) => {
+        const lower = String(t || "").toLowerCase();
+        return !lower || 
+          lower.includes("video stream") ||
+          lower.includes("hls video") ||
+          lower.includes("dash video") ||
+          lower.includes("mp4 video") ||
+          lower.includes("webm video") ||
+          lower.includes("mkv video") ||
+          lower.includes("youtube video") ||
+          lower.includes("vimeo video") ||
+          lower.includes("instagram video");
+      };
+
+      const getContentFingerprint = (v) => {
+        if (isGenericTitle(v.title)) return null;
+        return `${v.title || ''}|${v.resolution || ''}|${v.type || ''}`.toLowerCase();
+      };
+      
+      const videoFingerprint = getContentFingerprint(video);
+      
+      existingVideo = tabVideoRegistry[tabId].find(v => {
+        if (getCleanUrl(v.url) === videoCleanUrl) return true;
+        
+        const vPath = getUrlPath(v.url);
+        if (videoPath && videoPath.length > 5 && videoPath === vPath) {
+          return true;
+        }
+        
+        const vFingerprint = getContentFingerprint(v);
+        if (videoFingerprint && vFingerprint && videoFingerprint === vFingerprint) {
+          return true;
+        }
+        
+        // Match Instagram videos by caption (pageTitle) to find duplicate qualities
+        const isNewInstagram = video.url && video.url.includes("cdninstagram.com");
+        const vIsInstagram = v.url && v.url.includes("cdninstagram.com");
+        if (isNewInstagram && vIsInstagram && video.pageTitle && video.pageTitle !== "Video Stream") {
+          return v.pageTitle === video.pageTitle;
+        }
+        
+        return false;
+      });
       exists = !!existingVideo;
     }
 
-    if (!exists) {
-      chrome.tabs.get(tabId, async (tab) => {
-        let tabUrl = null;
-        let tabTitle = "Video Stream";
-        if (chrome.runtime.lastError || !tab) {
-          console.warn("[Detector] Failed to get tab info during registerVideo for tabId:", tabId, "using fallbacks.");
-        } else {
-          tabUrl = tab.url;
-          tabTitle = tab.title || "Video Stream";
-        }
-        
+    chrome.tabs.get(tabId, async (tab) => {
+      let tabUrl = null;
+      let tabTitle = "Video Stream";
+      if (chrome.runtime.lastError || !tab) {
+        console.warn("[Detector] Failed to get tab info during registerVideo for tabId:", tabId, "using fallbacks.");
+      } else {
+        tabUrl = tab.url;
+        tabTitle = tab.title || "Video Stream";
+      }
+      
+      const currentTitle = video.instagramDescription || tabTitle;
+
+      if (!exists) {
         const ruleUrl = video.frameUrl || tabUrl;
         if (ruleUrl) {
           await registerDnrRulesForDownload(tabId, ruleUrl);
@@ -631,7 +689,7 @@ function registerVideo(tabId, video) {
           }
         }
 
-        video.pageTitle = tabTitle;
+        video.pageTitle = currentTitle;
         
         // Fetch HLS qualities in background immediately to calculate options count
         if (video.type === "hls") {
@@ -673,25 +731,64 @@ function registerVideo(tabId, video) {
         console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
         
         updateBadgeCount(tabId);
-      });
-    } else if (existingVideo) {
-      let enriched = false;
-      if (video.thumbnail && !existingVideo.thumbnail) {
-        existingVideo.thumbnail = video.thumbnail;
-        enriched = true;
+      } else if (existingVideo) {
+        let enriched = false;
+        
+        // For Instagram quality selection: only overwrite if new video has a larger size (higher quality)
+        const isInstagramMatch = video.url && video.url.includes("cdninstagram.com") && 
+                                 existingVideo.url && existingVideo.url.includes("cdninstagram.com");
+        
+        if (isInstagramMatch) {
+          const newSize = video.sizeBytes || 0;
+          const oldSize = existingVideo.sizeBytes || 0;
+          if (newSize > oldSize) {
+            existingVideo.url = video.url;
+            existingVideo.sizeBytes = video.sizeBytes;
+            existingVideo.thumbnail = video.thumbnail || existingVideo.thumbnail;
+            enriched = true;
+            console.log(`[Detector] Replaced low quality Instagram video (${oldSize} bytes) with high quality (${newSize} bytes)`);
+          }
+        } else {
+          // Standard enrichment for other videos
+          if (video.thumbnail && !existingVideo.thumbnail) {
+            existingVideo.thumbnail = video.thumbnail;
+            enriched = true;
+          }
+          if (video.sizeBytes && !existingVideo.sizeBytes) {
+            existingVideo.sizeBytes = video.sizeBytes;
+            enriched = true;
+          }
+          if (video.audioUrl && !existingVideo.audioUrl) {
+            existingVideo.audioUrl = video.audioUrl;
+            enriched = true;
+          }
+        }
+        
+        if (video.instagramDescription && existingVideo.pageTitle !== video.instagramDescription) {
+          existingVideo.pageTitle = video.instagramDescription;
+          enriched = true;
+        }
+        
+        // Reel preloading shift fix: if this is a subsequent chunk fetch, it means it is playing,
+        // so we update its title to the current tab title/caption!
+        if (video.url && video.url.includes("cdninstagram.com") && video.url.includes("bytestart=")) {
+          try {
+            const bs = new URL(video.url).searchParams.get("bytestart");
+            if (bs && parseInt(bs, 10) > 0) {
+              if (existingVideo.pageTitle !== currentTitle) {
+                existingVideo.pageTitle = currentTitle;
+                enriched = true;
+                console.log(`[Detector] Updated preloaded Reel title to current tab title: ${currentTitle}`);
+              }
+            }
+          } catch (e) {}
+        }
+
+        if (enriched) {
+          console.log(`[Detector] Enriched existing video metadata: ${video.url}`);
+        }
       }
-      if (video.sizeBytes && !existingVideo.sizeBytes) {
-        existingVideo.sizeBytes = video.sizeBytes;
-        enriched = true;
-      }
-      if (video.audioUrl && !existingVideo.audioUrl) {
-        existingVideo.audioUrl = video.audioUrl;
-        enriched = true;
-      }
-      if (enriched) {
-        console.log(`[Detector] Enriched existing video metadata: ${video.url}`);
-      }
-    }
+    });
   };
 
   // If it's a DOM-detected direct video, check its size via HEAD request first
@@ -701,7 +798,8 @@ function registerVideo(tabId, video) {
         const len = res.headers.get("content-length");
         if (len) {
           const size = parseInt(len);
-          if (!isNaN(size) && size < 512000) {
+          const isInstagram = video.url && video.url.includes("cdninstagram.com");
+          if (!isInstagram && !isNaN(size) && size < MIN_DIRECT_MEDIA_SIZE) {
             console.log(`[Detector] Skipping small DOM media (${size} bytes): ${video.url}`);
             return;
           }
@@ -788,6 +886,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       registerVideo(tabId, message.video);
     }
+  } else if (message.action === "unregister_detected_video") {
+    if (tabId && message.url) {
+      const beforeCount = tabVideoRegistry[tabId].length;
+      const cleanUrl = message.url.split('?')[0].split('#')[0].toLowerCase();
+      tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => {
+        const vCleanUrl = v.url.split('?')[0].split('#')[0].toLowerCase();
+        return vCleanUrl !== cleanUrl;
+      });
+      if (tabVideoRegistry[tabId].length !== beforeCount) {
+        console.log(`[Detector] Unregistered video due to DOM removal: ${message.url}`);
+        updateBadgeCount(tabId);
+        chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+      }
+    }
+    sendResponse({ success: true });
   } else if (message.action === "get_detected_videos") {
     // Popup requesting detected list
     const videos = (tabVideoRegistry[message.tabId] || []).filter(isPlayableDetectedVideo);
