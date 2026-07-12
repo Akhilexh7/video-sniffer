@@ -1,6 +1,6 @@
 import { parseM3U8 } from './hls-parser.js';
 
-const MIN_DIRECT_MEDIA_SIZE = 2 * 1024 * 1024; // 2MB — filters out thumbnail previews and ad segments
+const MIN_DIRECT_MEDIA_SIZE = 100 * 1024; // 100KB — allows small files and clips, filters out tracking assets
 
 const YOUTUBE_ITAGS = {
   18: { resolution: "360p (MP4)", type: "mp4", title: "YouTube Video (with Audio)", hasAudio: true, hasVideo: true },
@@ -55,6 +55,40 @@ function cleanYoutubeUrl(urlStr) {
 
 console.log("[Background] Service worker (re)started at", new Date().toISOString());
 
+let nativePort = null;
+const recentlyActiveTabIds = new Set();
+const activeTabTimeouts = new Map();
+
+function markTabAsActive(tabId) {
+  if (!tabId || tabId < 0) return;
+  recentlyActiveTabIds.add(tabId);
+  if (activeTabTimeouts.has(tabId)) {
+    clearTimeout(activeTabTimeouts.get(tabId));
+  }
+  const timeoutId = setTimeout(() => {
+    recentlyActiveTabIds.delete(tabId);
+    activeTabTimeouts.delete(tabId);
+  }, 10 * 60 * 1000); // 10 min window to be safe
+  activeTabTimeouts.set(tabId, timeoutId);
+}
+
+// Mark active tabs at startup
+chrome.tabs.query({ active: true }, (tabs) => {
+  if (tabs) {
+    tabs.forEach(t => markTabAsActive(t.id));
+  }
+});
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  markTabAsActive(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tab.active) {
+    markTabAsActive(tabId);
+  }
+});
+
 // Tab-based video database
 // tabId -> Array of detected video objects
 let tabVideoRegistry = {};
@@ -97,6 +131,8 @@ loadRegistryFromStorage();
 const activeDownloads = {};
 
 let creatingOffscreen; // Global promise for offscreen lifecycle
+const dnrUrlRegistry = {}; // tabId -> pageUrl
+const tabRecentAudios = {}; // tabId -> Array of { url, contentType, timestamp }
 
 console.log("[Detector] Service Worker initialized.");
 
@@ -110,6 +146,8 @@ async function registerDnrRulesForDownload(tabId, pageUrl) {
   if (!pageUrl || (!pageUrl.startsWith("http://") && !pageUrl.startsWith("https://"))) {
     return;
   }
+  
+  dnrUrlRegistry[tabId] = pageUrl;
   
   try {
     const urlObj = new URL(pageUrl);
@@ -345,6 +383,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const { url, tabId, type, responseHeaders, statusCode } = details;
     if (tabId < 0) return;
 
+
     // Check resourceType FIRST (cheapest early-exit, no string/URL parsing)
     if (type === "image" || type === "stylesheet" || type === "font" || type === "script") {
       return;
@@ -428,12 +467,30 @@ chrome.webRequest.onHeadersReceived.addListener(
         return;
       }
 
+      // Intercept audio content types for video/audio pairing
+      const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
+      if (contentType.startsWith("audio/") || cleanUrlEndsWith(url, ".m4a") || cleanUrlEndsWith(url, ".aac") || cleanUrlEndsWith(url, ".mp3")) {
+        if (!tabRecentAudios[tabId]) {
+          tabRecentAudios[tabId] = [];
+        }
+        if (!tabRecentAudios[tabId].some(a => a.url === url)) {
+          tabRecentAudios[tabId].push({
+            url: url,
+            contentType: contentType,
+            timestamp: Date.now()
+          });
+          if (tabRecentAudios[tabId].length > 10) {
+            tabRecentAudios[tabId].shift();
+          }
+          console.log(`[Detector] Logged recent audio for tab ${tabId}: ${url}`);
+        }
+        return;
+      }
+
       // EXPLICITLY IGNORE HLS segment stream chunks (video/mp2t) to prevent flooding the list
       if (contentType.includes("video/mp2t") || cleanUrlEndsWith(url, ".ts")) {
         return;
       }
-
-      const cleanUrl = url.split('?')[0].split('#')[0].toLowerCase();
       const isManifest = contentType.includes("mpegurl") || contentType.includes("dash+xml") || cleanUrl.includes(".m3u8") || cleanUrl.includes(".mpd");
       const normalizedMediaUrl = isManifest ? url : normalizeRangedMediaUrl(url);
       const normalizedRangeUrl = normalizedMediaUrl !== url;
@@ -512,13 +569,21 @@ chrome.webRequest.onHeadersReceived.addListener(
           return;
         }
 
+        let bytestartVal = undefined;
+        try {
+          const urlObj = new URL(url);
+          const bs = urlObj.searchParams.get("bytestart");
+          if (bs) bytestartVal = parseInt(bs, 10);
+        } catch (e) {}
+
         registerVideo(tabId, {
           url: normalizedMediaUrl,
           type: mediaType,
           quality: "Network",
           resolution: mediaType === "hls" || mediaType === "dash" ? "Auto" : "Direct",
           title: mediaTitle,
-          sizeBytes
+          sizeBytes,
+          bytestart: bytestartVal
         });
       }
     }
@@ -530,6 +595,28 @@ chrome.webRequest.onHeadersReceived.addListener(
 function cleanUrlEndsWith(url, ext) {
   const clean = url.split('?')[0].split('#')[0].toLowerCase();
   return clean.endsWith(ext);
+}
+
+function calculateUrlSimilarity(url1, url2) {
+  try {
+    const u1 = new URL(url1);
+    const u2 = new URL(url2);
+    if (u1.origin !== u2.origin) return -1;
+    
+    const p1 = u1.pathname.split('/');
+    const p2 = u2.pathname.split('/');
+    let matchCount = 0;
+    for (let i = 0; i < Math.min(p1.length, p2.length); i++) {
+      if (p1[i] === p2[i]) {
+        matchCount++;
+      } else {
+        break;
+      }
+    }
+    return matchCount;
+  } catch (e) {
+    return -1;
+  }
 }
 
 function hasRangeQueryParams(urlStr) {
@@ -544,9 +631,6 @@ function hasRangeQueryParams(urlStr) {
 function normalizeRangedMediaUrl(urlStr) {
   try {
     const url = new URL(urlStr);
-    if (url.hostname.includes("cdninstagram.com")) {
-      return url.href;
-    }
     [
       "bytestart",
       "byteend",
@@ -575,12 +659,7 @@ function parseContentRange(value) {
 
 function isPlayableDetectedVideo(video) {
   if (!video) return false;
-  if (video.type === "youtube") return true;
-  if (video.type === "hls") return true;
-  if (video.hasVideo === false) return false;
-  if (video.hasAudio === false && !video.audioUrl) return false;
-  const title = String(video.title || "").toLowerCase();
-  return !title.includes("video only");
+  return !!video.url || video.type === "youtube" || video.type === "hls" || video.type === "dash";
 }
 
 // Limits memory growth by evicting oldest DOM-source video entries first
@@ -603,6 +682,41 @@ function registerVideo(tabId, video) {
     tabVideoRegistry[tabId] = [];
   }
 
+  if (video.bytestart === undefined && video.url) {
+    try {
+      const urlObj = new URL(video.url);
+      const bs = urlObj.searchParams.get("bytestart");
+      if (bs) video.bytestart = parseInt(bs, 10);
+    } catch (e) {}
+  }
+
+  // Attempt to pair video with recently intercepted audio track
+  if (video.type !== "youtube" && video.type !== "hls" && video.type !== "dash" && !video.audioUrl && video.url) {
+    const recentAudios = tabRecentAudios[tabId] || [];
+    const now = Date.now();
+    const activeAudios = recentAudios.filter(a => now - a.timestamp < 30000);
+    tabRecentAudios[tabId] = activeAudios; // keep registry pruned
+    
+    if (activeAudios.length > 0) {
+      let bestAudioUrl = null;
+      let highestScore = -1;
+      
+      activeAudios.forEach((audio) => {
+        const score = calculateUrlSimilarity(video.url, audio.url);
+        if (score > highestScore) {
+          highestScore = score;
+          bestAudioUrl = audio.url;
+        }
+      });
+      
+      if (bestAudioUrl && highestScore >= 1) {
+        video.audioUrl = bestAudioUrl;
+        video.title = `${video.title || "Video"} + Audio`;
+        console.log(`[Detector] Paired direct video-only link with audio track. Score: ${highestScore}. Video: ${video.url}, Audio: ${bestAudioUrl}`);
+      }
+    }
+  }
+
   if (video.type === "youtube") {
     const idx = tabVideoRegistry[tabId].findIndex(v => v.type === "youtube");
     if (idx !== -1) {
@@ -617,7 +731,7 @@ function registerVideo(tabId, video) {
     return;
   }
 
-  if (video.url && video.type !== "hls" && video.type !== "dash" && !video.url.includes("cdninstagram.com")) {
+  if (video.url && video.type !== "hls" && video.type !== "dash") {
     video.url = normalizeRangedMediaUrl(video.url);
   }
 
@@ -625,10 +739,6 @@ function registerVideo(tabId, video) {
   const isManifest = video.type === "hls" || video.type === "dash" || (video.url && (video.url.includes(".m3u8") || video.url.includes(".mpd")));
 
   const doRegister = () => {
-    if (video.type !== "hls" && video.hasVideo === false) {
-      console.log(`[Detector] Ignoring incomplete media entry: ${video.url}`);
-      return;
-    }
 
     let exists = false;
     let existingVideo = null;
@@ -830,17 +940,13 @@ function registerVideo(tabId, video) {
         
         // Reel preloading shift fix: if this is a subsequent chunk fetch, it means it is playing,
         // so we update its title to the current tab title/caption!
-        if (video.url && video.url.includes("cdninstagram.com") && video.url.includes("bytestart=")) {
-          try {
-            const bs = new URL(video.url).searchParams.get("bytestart");
-            if (bs && parseInt(bs, 10) > 0) {
-              if (existingVideo.pageTitle !== currentTitle) {
-                existingVideo.pageTitle = currentTitle;
-                enriched = true;
-                console.log(`[Detector] Updated preloaded Reel title to current tab title: ${currentTitle}`);
-              }
-            }
-          } catch (e) {}
+        const isInstagramUrl = (video.url && video.url.includes("cdninstagram.com")) || (existingVideo.url && existingVideo.url.includes("cdninstagram.com"));
+        if (isInstagramUrl && video.bytestart !== undefined && video.bytestart > 0) {
+          if (existingVideo.pageTitle !== currentTitle) {
+            existingVideo.pageTitle = currentTitle;
+            enriched = true;
+            console.log(`[Detector] Updated preloaded Reel title to current tab title: ${currentTitle}`);
+          }
         }
 
         if (enriched) {
@@ -896,8 +1002,12 @@ function updateBadgeCount(tabId) {
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#4f46e5" });
 }
 
-// 3. Handle messages from Content Script and Popup UI
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const activeTabId = sender.tab ? sender.tab.id : (message.tabId || null);
+  if (activeTabId) {
+    markTabAsActive(activeTabId);
+  }
+
   if (message.action === "background_proxy_fetch") {
     const options = {};
     if (typeof message.frameId === "number") {
@@ -919,6 +1029,95 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   const tabId = sender.tab ? sender.tab.id : null;
+
+  if (message.action === "start_backend") {
+    if (nativePort) {
+      sendResponse({ success: true, running: true });
+      return;
+    }
+    
+    try {
+      console.log("[Background] Attempting to connect to native backend...");
+      nativePort = chrome.runtime.connectNative("com.unvdownloader.backend");
+      
+      let disconnected = false;
+      let responseSent = false;
+
+      nativePort.onMessage.addListener((msg) => {
+        console.log("[Background] Native backend message:", msg);
+      });
+      
+      nativePort.onDisconnect.addListener(() => {
+        const errMsg = chrome.runtime.lastError ? chrome.runtime.lastError.message : "Disconnected immediately";
+        console.log("[Background] Native backend disconnected. Last error:", errMsg);
+        nativePort = null;
+        disconnected = true;
+        
+        if (!responseSent) {
+          responseSent = true;
+          sendResponse({ success: false, error: errMsg });
+        }
+        chrome.runtime.sendMessage({ action: "backend_status_changed", running: false }).catch(() => {});
+      });
+      
+      // Wait for Express server to boot up and verify via fetch polling
+      let attempts = 0;
+      const checkInterval = setInterval(() => {
+        attempts++;
+        if (disconnected) {
+          clearInterval(checkInterval);
+          return;
+        }
+        
+        fetch("http://localhost:3000/api/ping")
+          .then(res => {
+            if (res.ok) {
+              clearInterval(checkInterval);
+              if (!responseSent) {
+                responseSent = true;
+                sendResponse({ success: true, running: true });
+              }
+              chrome.runtime.sendMessage({ action: "backend_status_changed", running: true }).catch(() => {});
+            }
+          })
+          .catch(() => {
+            if (attempts > 8) { // 8 attempts * 500ms = 4 seconds timeout
+              clearInterval(checkInterval);
+              if (!responseSent) {
+                responseSent = true;
+                // If it's taking longer but port is still open, assume success
+                sendResponse({ success: nativePort !== null, running: nativePort !== null });
+              }
+            }
+          });
+      }, 500);
+      
+      return true; // Keep channel open for async response
+    } catch (e) {
+      console.error("[Background] Failed to connect to native backend:", e);
+      nativePort = null;
+      sendResponse({ success: false, error: e.message });
+    }
+    
+  } else if (message.action === "stop_backend") {
+    if (nativePort) {
+      console.log("[Background] Stopping native backend...");
+      nativePort.disconnect();
+      nativePort = null;
+    }
+    chrome.runtime.sendMessage({ action: "backend_status_changed", running: false }).catch(() => {});
+    sendResponse({ success: true, running: false });
+    
+  } else if (message.action === "get_backend_status") {
+    fetch("http://localhost:3000/api/ping")
+      .then(res => {
+        sendResponse({ running: res.ok });
+      })
+      .catch(() => {
+        sendResponse({ running: nativePort !== null });
+      });
+    return true; // async
+  }
 
   if (message.action === "clear_video_registry") {
     if (tabId) {
@@ -966,8 +1165,71 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   } else if (message.action === "get_detected_videos") {
     // Popup requesting detected list
-    const videos = (tabVideoRegistry[message.tabId] || []).filter(isPlayableDetectedVideo);
-    sendResponse({ videos });
+    const targetTabId = message.tabId || (sender.tab ? sender.tab.id : null);
+    if (targetTabId) {
+      chrome.tabs.get(targetTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          const videos = (tabVideoRegistry[targetTabId] || []).filter(isPlayableDetectedVideo);
+          sendResponse({ videos });
+          return;
+        }
+
+        const url = tab.url || "";
+        const isYoutubeWatchPage = url.includes("youtube.com/watch") || url.includes("youtu.be/");
+        
+        if (isYoutubeWatchPage) {
+          if (!tabVideoRegistry[targetTabId]) {
+            tabVideoRegistry[targetTabId] = [];
+          }
+          const registry = tabVideoRegistry[targetTabId];
+          const hasYoutubeCard = registry.some(v => v.type === "youtube");
+          
+          if (!hasYoutubeCard) {
+            console.log(`[Background] Auto-injecting YouTube card for active watch tab: ${url}`);
+            let videoId = null;
+            try {
+              const urlObj = new URL(url);
+              videoId = urlObj.searchParams.get("v");
+              if (!videoId && url.includes("youtu.be/")) {
+                videoId = urlObj.pathname.slice(1).split("/")[0];
+              }
+            } catch (e) {}
+
+            const thumbnail = videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+            const title = tab.title || "YouTube Video";
+            
+            const dummyVideo = {
+              url: url,
+              type: "youtube",
+              quality: "YouTube",
+              resolution: "Multi Quality",
+              title: title,
+              thumbnail: thumbnail,
+              qualities: [], // Popup will render standard yt-dlp qualities
+              pageTitle: title
+            };
+
+            tabYoutubeMediaState[targetTabId] = {
+              videoId: videoId,
+              title: title,
+              thumbnail: thumbnail,
+              videoUrls: {},
+              audioUrls: {}
+            };
+
+            registry.push(dummyVideo);
+            updateBadgeCount(targetTabId);
+            persistDebounced();
+          }
+        }
+
+        const videos = (tabVideoRegistry[targetTabId] || []).filter(isPlayableDetectedVideo);
+        sendResponse({ videos });
+      });
+      return true; // Keep message channel open
+    } else {
+      sendResponse({ videos: [] });
+    }
   } else if (message.action === "get_download_progress") {
     // Popup requesting active download state
     const info = activeDownloads[message.tabId];
@@ -990,7 +1252,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   } else if (message.action === "start_youtube_download") {
     // Delegate YouTube video download to offscreen document
-    handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId);
+    handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId, message.youtubeUrl);
     sendResponse({ success: true });
   } else if (message.action === "cancel_hls_download") {
     // Cancel download in offscreen document
@@ -1014,6 +1276,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Download errored, clean up
     delete activeDownloads[message.tabId];
     closeOffscreenDocument();
+  } else if (message.action === "unregister_dnr_rules") {
+    unregisterDnrRulesForDownload(message.tabId).then(() => {
+      sendResponse({ success: true });
+    });
+    return true;
+  } else if (message.action === "register_dnr_rules_for_tab") {
+    const pageUrl = dnrUrlRegistry[message.tabId];
+    if (pageUrl) {
+      registerDnrRulesForDownload(message.tabId, pageUrl).then(() => {
+        sendResponse({ success: true });
+      });
+    } else {
+      sendResponse({ success: false, error: "No pageUrl registered for tab" });
+    }
+    return true;
   }
   return true;
 });
@@ -1022,6 +1299,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete tabVideoRegistry[tabId];
   delete tabYoutubeMediaState[tabId];
+  delete tabRecentAudios[tabId];
   unregisterDnrRulesForDownload(tabId);
   persistDebounced();
   if (activeDownloads[tabId]) {
@@ -1054,6 +1332,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     console.log(`[Detector] Tab ${tabId} navigated to ${changeInfo.url}. Clearing registry.`);
     tabVideoRegistry[tabId] = [];
     delete tabYoutubeMediaState[tabId];
+    delete tabRecentAudios[tabId];
     unregisterDnrRulesForDownload(tabId);
     chrome.action.setBadgeText({ tabId, text: "" });
     persistDebounced();
@@ -1227,8 +1506,8 @@ async function handleDirectDownload(tabId, url, pageTitle, expectedSize, frameId
   }
 }
 
-async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resolution, frameId) {
-  console.log(`[Downloader] Delegating YouTube Download for tab ${tabId} to Offscreen Document.`);
+async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resolution, frameId, youtubeUrl = null) {
+  console.log(`[Downloader] Delegating YouTube Download for tab ${tabId} to Offscreen Document. Custom URL: ${youtubeUrl}`);
   
   activeDownloads[tabId] = { videoUrl, audioUrl, progress: 0 };
   
@@ -1238,9 +1517,9 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
     const tab = await chrome.tabs.get(tabId);
     const title = pageTitle || ((tab && tab.title) ? tab.title : "youtube_video");
     
-    const frameUrl = getFrameUrlForVideo(tabId, videoUrl) || tab?.url;
-    if (frameUrl) {
-      await registerDnrRulesForDownload(tabId, frameUrl);
+    const targetUrl = youtubeUrl || getFrameUrlForVideo(tabId, videoUrl) || tab?.url || null;
+    if (targetUrl) {
+      await registerDnrRulesForDownload(tabId, targetUrl);
     }
     
     await chrome.runtime.sendMessage({
@@ -1248,6 +1527,7 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
       tabId: tabId,
       videoUrl: videoUrl,
       audioUrl: audioUrl,
+      youtubeUrl: targetUrl,
       pageTitle: title,
       resolution: resolution,
       frameId: frameId

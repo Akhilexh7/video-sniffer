@@ -1065,9 +1065,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "proxy_fetch") {
     const { url, options, responseType } = message;
     
+    // Only proxy requests to the same origin as the page, or an allowed CDN domain
+    const pageOrigin = window.location.origin;
+    let requestOrigin;
+    try {
+      requestOrigin = new URL(url).origin;
+    } catch (e) {
+      sendResponse({ success: false, error: "Invalid URL" });
+      return true;
+    }
+
+    const isSameOrigin = requestOrigin === pageOrigin;
+    const isKnownCdn = /googlevideo\.com|cdninstagram\.com|phncdn\.com/.test(requestOrigin);
+
+    if (!isSameOrigin && !isKnownCdn) {
+      console.warn("[Proxy Fetch] Rejected — origin not allowlisted:", requestOrigin);
+      sendResponse({ success: false, error: "Origin not permitted for proxy fetch" });
+      return true;
+    }
+
     fetch(url, options)
       .then(async (response) => {
         if (!response.ok) {
+          if (response.status === 403) {
+            console.error('[Download Diagnostics] HTTP 403 Forbidden on proxy fetch', {
+              url: url,
+              requestHeaders: options ? options.headers : null,
+              responseHeaders: Object.fromEntries(response.headers.entries()),
+              timestamp: new Date().toISOString()
+            });
+          }
           sendResponse({
             success: false,
             status: response.status,

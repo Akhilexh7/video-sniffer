@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq9nMFcdUSx46uF88zwVdE0hvbJ0JOchahs9izBQoSnY8M1C/Pdp+uUJiue/GCofh8MTljkuBhUaUPMK9FVggIzyBYWl/mHhURKT+y7RhNVJfw9GB9kluEakDOuhWFTSGbFJ6jQdKmgYSzFkPkfj5As90Xb1oluynKLj+WiXttLZErDEnhQeXROxOA8856it+UXi33LqY3MfdbGkJpakE7SYQ+59PTZ1H1qM3cJmJmOLqXGqSRCkvIB0ea10WCodQDbs3t05drFfbfTVgzBwL8N9CxSVfiJDkCz9BmyhjnV/JxDN3Hp/TXPKsECcLGEQ78k4heIKGHpOs25LQCux2iwIDAQAB",
   "name": "UNV Downloader - Video Detector & Downloader",
   "version": "1.0",
   "description": "Detects and downloads videos (HTML5 & HLS/m3u8) directly from any webpage.",
@@ -16,7 +17,8 @@
     "activeTab",
     "offscreen",
     "declarativeNetRequest",
-    "scripting"
+    "scripting",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"

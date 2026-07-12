@@ -9,7 +9,7 @@
 <body>
   <div class="app-container">
     <!-- Header -->
-    <header class="app-header">
+    <header class="app-header" style="display: flex; justify-content: space-between; align-items: center;">
       <div class="logo-area">
         <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -17,6 +17,10 @@
           <line x1="12" y1="15" x2="12" y2="3"></line>
         </svg>
         <h1 class="logo-title">unv-<span>downloader</span></h1>
+      </div>
+      <div class="backend-controls" style="display: flex; align-items: center; gap: 8px;">
+        <span id="backend-status-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; display: inline-block; transition: background 0.3s;"></span>
+        <button id="toggle-backend-btn" class="btn btn-secondary btn-sm" style="font-size: 10px; padding: 4px 8px; border-radius: 4px; background: rgba(255,255,255,0.08); color: var(--text-primary); border: 1px solid rgba(255,255,255,0.15); cursor: pointer; transition: all 0.2s;">Start Backend</button>
       </div>
     </header>
 
@@ -59,9 +63,19 @@
       <!-- State 2: Detected Videos List -->
       <div id="state-detected" class="view-state hidden">
         <div class="control-header">
+          <span class="scan-status-text">Detected <span id="detected-count">0</span> videos</span>
+          <button id="deep-scan-btn" class="btn btn-secondary btn-sm">Deep Scan</button>
         </div>
-        <div id="video-list" class="video-list-container">
-          <!-- Dynamic Items Injected Here -->
+        <div id="youtube-section" class="media-section" style="width: 100%; margin-bottom: 14px;">
+          <div class="section-title" style="font-size: 11px; font-weight: 700; color: var(--accent-secondary); text-transform: uppercase; margin-bottom: 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 4px; letter-spacing: 0.5px;">YouTube Downloads</div>
+          <div id="youtube-list" class="video-list-container"></div>
+        </div>
+
+        <div id="generic-section" class="media-section" style="width: 100%;">
+          <div class="section-title" style="font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 4px; letter-spacing: 0.5px;">Browser Detections</div>
+          <div id="video-list" class="video-list-container">
+            <!-- Dynamic Items Injected Here -->
+          </div>
         </div>
       </div>
 
@@ -83,6 +97,22 @@
       <div id="quality-options" class="options-list">
         <!-- Dynamic Quality Lists Injected Here -->
       </div>
+    </div>
+  </div>
+
+  <!-- Custom Alert Dialog -->
+  <div id="alert-dialog" class="center-dialog hidden">
+    <div class="center-dialog-content">
+      <div class="alert-icon" style="margin-bottom: 10px; color: #ff4d4d; display: inline-block;">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+          <line x1="12" y1="9" x2="12" y2="13"></line>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+      </div>
+      <h3 style="margin-bottom: 6px; font-size: 13px; font-weight: 600; color: var(--text-primary);">Action Required</h3>
+      <p id="alert-message" style="font-size: 11px; color: var(--text-secondary); line-height: 1.4; margin-bottom: 14px; text-align: center;"></p>
+      <button id="alert-ok-btn" class="btn btn-primary" style="width: 100%; padding: 6px; font-size: 11px; border-radius: 6px; cursor: pointer;">OK</button>
     </div>
   </div>
 

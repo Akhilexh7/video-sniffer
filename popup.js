@@ -2,12 +2,16 @@
 import { parseM3U8 } from './hls-parser.js';
 
 let activeTabId = null;
+let activeTabUrl = "";
 let currentVideos = [];
 
 // DOM Elements
 const stateWaiting = document.getElementById("state-waiting");
 const stateDetected = document.getElementById("state-detected");
 const videoList = document.getElementById("video-list");
+const youtubeSection = document.getElementById("youtube-section");
+const youtubeList = document.getElementById("youtube-list");
+const genericSection = document.getElementById("generic-section");
 
 // Inline Download Banner Elements
 const downloadProgressBanner = document.getElementById("download-progress-banner");
@@ -20,6 +24,32 @@ const qualityDialog = document.getElementById("quality-dialog");
 const qualityOptions = document.getElementById("quality-options");
 const closeDialogBtn = document.getElementById("close-dialog-btn");
 
+// Backend Control Elements
+const backendStatusDot = document.getElementById("backend-status-dot");
+const toggleBackendBtn = document.getElementById("toggle-backend-btn");
+
+// Custom Alert Dialog Elements
+const alertDialog = document.getElementById("alert-dialog");
+const alertMessage = document.getElementById("alert-message");
+const alertOkBtn = document.getElementById("alert-ok-btn");
+
+function showCustomAlert(message) {
+  if (!alertDialog || !alertMessage || !alertOkBtn) {
+    alert(message);
+    return;
+  }
+  alertMessage.innerText = message;
+  alertDialog.classList.remove("hidden");
+  
+  // Clone button to strip old listeners
+  const newBtn = alertOkBtn.cloneNode(true);
+  alertOkBtn.parentNode.replaceChild(newBtn, alertOkBtn);
+  
+  newBtn.addEventListener("click", () => {
+    alertDialog.classList.add("hidden");
+  });
+}
+
 // Initialize popup
 async function init() {
   console.log("[Detector] Popup opened.");
@@ -28,8 +58,15 @@ async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
   activeTabId = tab.id;
+  activeTabUrl = tab.url || "";
 
-  // 1. Fetch detected videos for the active tab (unconditional, so they stay visible)
+  // 1. Initialize backend controls
+  if (toggleBackendBtn) {
+    toggleBackendBtn.addEventListener("click", handleToggleBackend);
+    updateBackendStatusUI();
+  }
+
+  // 2. Fetch detected videos for the active tab (unconditional, so they stay visible)
   refreshVideoList();
 
   // 2. Check if there's an active download running for this tab to show inline progress
@@ -107,14 +144,19 @@ async function triggerDeepScan() {
 }
 
 function refreshVideoList() {
-  chrome.runtime.sendMessage({ action: "get_detected_videos", tabId: activeTabId }, async (response) => {
-    if (response && response.videos && response.videos.length > 0) {
-      const sortedVideos = sortVideosBySize(response.videos);
-      currentVideos = sortedVideos;
-      renderVideoCards(sortedVideos);
-    } else {
-      showState("waiting");
+  chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    if (tab) {
+      activeTabUrl = tab.url || "";
     }
+    chrome.runtime.sendMessage({ action: "get_detected_videos", tabId: activeTabId }, async (response) => {
+      if (response && response.videos && response.videos.length > 0) {
+        const sortedVideos = sortVideosBySize(response.videos);
+        currentVideos = sortedVideos;
+        renderVideoCards(sortedVideos);
+      } else {
+        showState("waiting");
+      }
+    });
   });
 }
 
@@ -162,6 +204,13 @@ function getSortableSizeBytes(video) {
 function renderVideoCards(videos) {
   console.log("[Popup] renderVideoCards called. Videos:", videos);
   videoList.innerHTML = "";
+  youtubeList.innerHTML = "";
+  
+  if (!videos || videos.length === 0) {
+    showState("waiting");
+    return;
+  }
+
   showState("detected");
 
   const detectedCountEl = document.getElementById("detected-count");
@@ -217,7 +266,12 @@ function renderVideoCards(videos) {
         displayTitle = getFilenameFromUrl(video.url);
       }
       
-      let isYoutube = video.url && (video.url.includes("googlevideo.com") || video.url.includes("youtube.com"));
+      let isYoutube = video.url && (
+        video.url.includes("googlevideo.com") || 
+        video.url.includes("youtube.com") || 
+        video.url.includes("youtu.be") || 
+        video.url.includes("youtube-nocookie.com")
+      );
       if (res && res !== "Direct" && res !== "Auto") {
         displayTitle = `${displayTitle} (${res})`;
       }
@@ -230,101 +284,151 @@ function renderVideoCards(videos) {
         ? `<span class="size-highlight" style="color: var(--accent-secondary); font-weight: 600;">${sizeText}</span>`
         : `<span>${sizeText}</span>`;
 
-      card.innerHTML = `
-        <div class="video-info">
-          ${previewMarkup}
-          <div class="video-meta">
-            <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
-            <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
-              <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeMarkup}${qualityLabel}</span>
+      if (video.audioUrl) {
+        card.innerHTML = `
+          <div class="video-info">
+            ${previewMarkup}
+            <div class="video-meta">
+              <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
+              <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
+                <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeMarkup}${qualityLabel}</span>
+              </div>
             </div>
           </div>
-        </div>
-        <button class="btn btn-primary download-action-btn">
-          ${downloadText}
-        </button>
-      `;
+          <div class="card-actions" style="display: flex; gap: 8px; width: 100%;">
+            <button class="btn btn-primary download-combined-btn" style="flex: 1; font-size: 11px; padding: 6px 12px; border-radius: 6px; font-weight: 600;">
+              Merge + Audio
+            </button>
+            <button class="btn btn-secondary download-video-btn" style="flex: 1; font-size: 11px; padding: 6px 12px; border-radius: 6px; font-weight: 600; border: 1px solid rgba(255, 255, 255, 0.25);">
+              Video Only
+            </button>
+          </div>
+        `;
 
-      card.querySelector(".download-action-btn").addEventListener("click", () => {
-        if (video.audioUrl) {
+        card.querySelector(".download-combined-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
           startCombinedMediaDownload(video);
-        } else {
+        });
+        card.querySelector(".download-video-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
           startDirectDownload(video);
-        }
-      });
-      card.addEventListener("click", (e) => {
-        if (!e.target.classList.contains("download-action-btn")) {
-          if (video.audioUrl) {
-            startCombinedMediaDownload(video);
-          } else {
-            startDirectDownload(video);
-          }
-        }
-      });
+        });
+      } else {
+        card.innerHTML = `
+          <div class="video-info">
+            ${previewMarkup}
+            <div class="video-meta">
+              <div class="video-title" style="font-size: 14px; font-weight: 600; color: var(--text-primary);">${displayTitle}</div>
+              <div class="video-domain" style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">
+                <span class="video-type-badge ${ext}">${ext.toUpperCase()}</span> <span style="vertical-align: middle;">${isYoutube ? "YouTube Stream | " : ""}${sizeMarkup}${qualityLabel}</span>
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary download-action-btn" style="border-radius: 6px; font-weight: 600; padding: 6px 12px; font-size: 11px;">
+            ${downloadText}
+          </button>
+        `;
+
+        card.querySelector(".download-action-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          startDirectDownload(video);
+        });
+      }
     }
 
     requestVideoPreview(card, video);
     return card;
   };
 
-  const primaryVideos = videos.slice(0, 3);
-  const secondaryVideos = videos.slice(3);
+  const populateList = (container, videosList) => {
+    container.innerHTML = "";
+    const primaryVideos = videosList.slice(0, 3);
+    const secondaryVideos = videosList.slice(3);
 
-  primaryVideos.forEach((video) => {
-    videoList.appendChild(createCard(video));
-  });
-
-  if (secondaryVideos.length > 0) {
-    const toggleContainer = document.createElement("div");
-    toggleContainer.className = "collapsed-videos-container";
-    toggleContainer.style.marginTop = "12px";
-    toggleContainer.style.marginBottom = "8px";
-
-    const toggleButton = document.createElement("button");
-    toggleButton.className = "btn btn-secondary";
-    toggleButton.style.display = "flex";
-    toggleButton.style.justifyContent = "center";
-    toggleButton.style.alignItems = "center";
-    toggleButton.style.gap = "6px";
-    toggleButton.innerHTML = `
-      <span>Show all (${secondaryVideos.length} more)</span>
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;">
-        <polyline points="6 9 12 15 18 9"></polyline>
-      </svg>
-    `;
-
-    const collapsedContent = document.createElement("div");
-    collapsedContent.className = "collapsed-content hidden";
-    collapsedContent.style.marginTop = "10px";
-    collapsedContent.style.display = "flex";
-    collapsedContent.style.flexDirection = "column";
-    collapsedContent.style.gap = "10px";
-
-    secondaryVideos.forEach((video) => {
-      collapsedContent.appendChild(createCard(video));
+    primaryVideos.forEach((video) => {
+      container.appendChild(createCard(video));
     });
 
-    toggleButton.addEventListener("click", () => {
-      const isHidden = collapsedContent.classList.contains("hidden");
-      const svg = toggleButton.querySelector("svg");
-      if (isHidden) {
-        collapsedContent.classList.remove("hidden");
-        collapsedContent.style.display = "flex";
-        toggleButton.querySelector("span").textContent = "Hide extra videos";
-        if (svg) svg.style.transform = "rotate(180deg)";
-      } else {
-        collapsedContent.classList.add("hidden");
-        collapsedContent.style.display = "none";
-        toggleButton.querySelector("span").textContent = `Show all (${secondaryVideos.length} more)`;
-        if (svg) svg.style.transform = "rotate(0deg)";
-      }
-    });
+    if (secondaryVideos.length > 0) {
+      const toggleContainer = document.createElement("div");
+      toggleContainer.className = "collapsed-videos-container";
+      toggleContainer.style.marginTop = "12px";
+      toggleContainer.style.marginBottom = "8px";
 
-    toggleContainer.appendChild(toggleButton);
-    toggleContainer.appendChild(collapsedContent);
-    videoList.appendChild(toggleContainer);
-    
-    collapsedContent.style.display = "none";
+      const toggleButton = document.createElement("button");
+      toggleButton.className = "btn btn-secondary";
+      toggleButton.style.display = "flex";
+      toggleButton.style.justifyContent = "center";
+      toggleButton.style.alignItems = "center";
+      toggleButton.style.gap = "6px";
+      toggleButton.innerHTML = `
+        <span>Show all (${secondaryVideos.length} more)</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;">
+          <polyline points="6 9 12 15 18 9"></polyline>
+        </svg>
+      `;
+
+      const collapsedContent = document.createElement("div");
+      collapsedContent.className = "collapsed-content hidden";
+      collapsedContent.style.marginTop = "10px";
+      collapsedContent.style.display = "flex";
+      collapsedContent.style.flexDirection = "column";
+      collapsedContent.style.gap = "10px";
+
+      secondaryVideos.forEach((video) => {
+        collapsedContent.appendChild(createCard(video));
+      });
+
+      toggleButton.addEventListener("click", () => {
+        const isHidden = collapsedContent.classList.contains("hidden");
+        const svg = toggleButton.querySelector("svg");
+        if (isHidden) {
+          collapsedContent.classList.remove("hidden");
+          collapsedContent.style.display = "flex";
+          toggleButton.querySelector("span").textContent = "Hide extra videos";
+          if (svg) svg.style.transform = "rotate(180deg)";
+        } else {
+          collapsedContent.classList.add("hidden");
+          collapsedContent.style.display = "none";
+          toggleButton.querySelector("span").textContent = `Show all (${secondaryVideos.length} more)`;
+          if (svg) svg.style.transform = "rotate(0deg)";
+        }
+      });
+
+      toggleContainer.appendChild(toggleButton);
+      toggleContainer.appendChild(collapsedContent);
+      container.appendChild(toggleContainer);
+      
+      collapsedContent.style.display = "none";
+    }
+  };
+
+  const isOnYoutubePage = activeTabUrl && (activeTabUrl.includes("youtube.com") || activeTabUrl.includes("youtu.be"));
+
+  const isYoutubeVideo = (v) => {
+    if (v.type === "youtube") return true;
+    if (isOnYoutubePage) return true; // Categorize everything under YouTube Downloads if we are on a YouTube host page
+    if (!v.url) return false;
+    const urlLower = v.url.toLowerCase();
+    return urlLower.includes("youtube.com") || 
+           urlLower.includes("youtu.be") || 
+           urlLower.includes("googlevideo.com") || 
+           urlLower.includes("youtube-nocookie.com");
+  };
+
+  const youtubeVideos = videos.filter(isYoutubeVideo);
+  const genericVideos = videos.filter(v => !isYoutubeVideo(v));
+
+  if (youtubeVideos.length > 0) {
+    populateList(youtubeList, youtubeVideos);
+  } else {
+    youtubeList.innerHTML = `<div class="state-desc" style="padding: 10px 0; text-align: left; font-size: 11px; color: var(--text-tertiary);">No YouTube videos detected on this page.</div>`;
+  }
+
+  if (genericVideos.length > 0) {
+    populateList(videoList, genericVideos);
+  } else {
+    videoList.innerHTML = `<div class="state-desc" style="padding: 10px 0; text-align: left; font-size: 11px; color: var(--text-tertiary);">No browser detections on this page.</div>`;
   }
 }
 
@@ -464,34 +568,59 @@ async function handleMultiQualityCardClick(video) {
     qualityOptions.innerHTML = "<div class='state-desc' style='padding: 20px 0; text-align: center;'>Parsing qualities...</div>";
 
     if (video.type === "youtube") {
-      qualityOptions.innerHTML = "";
-      if (video.qualities && video.qualities.length > 0) {
-        video.qualities.forEach((q) => {
+      qualityOptions.innerHTML = "<div class='state-desc' style='padding: 20px 0; text-align: center; font-size: 12px; color: var(--text-secondary);'>Analyzing available qualities...</div>";
+      
+      const renderFallback = () => {
+        qualityOptions.innerHTML = "";
+        const stdQualities = [
+          { label: "Best Quality (Default)", res: "Best" },
+          { label: "1080p (Full HD)", res: "1080p" },
+          { label: "720p (HD)", res: "720p" },
+          { label: "480p (Standard)", res: "480p" },
+          { label: "360p (Low)", res: "360p" }
+        ];
+
+        stdQualities.forEach((q) => {
           createModalOptionButton(
-            q.isProgressive ? `${q.resolution}` : `${q.resolution} [Adaptive Mux]`, 
-            q.container.toUpperCase(), 
+            q.label, 
+            q.res, 
             "", 
             () => {
               qualityDialog.classList.add("hidden");
-              if (q.isProgressive || !q.audioUrl) {
-                chrome.runtime.sendMessage({
-                  action: "start_direct_download",
-                  tabId: activeTabId,
-                  url: q.videoUrl,
-                  pageTitle: video.pageTitle || video.title || "YouTube Video",
-                  expectedSize: q.sizeBytes || null,
-                  frameId: video.frameId || null
-                });
-                showDownloadProgress(0);
-              } else {
-                startYoutubeDownload(q.videoUrl, q.audioUrl, video.pageTitle || video.title || "YouTube Video", q.resolution, video.frameId || null);
-              }
+              startYoutubeDownload(null, null, video.pageTitle || video.title || "YouTube Video", q.res, video.frameId || null, activeTabUrl || video.url);
             }
           );
         });
-      } else {
-        qualityOptions.innerHTML = "<div class='state-desc' style='padding: 20px 0; text-align: center;'>No qualities available yet. Try playing the video.</div>";
-      }
+      };
+
+      const targetUrl = video.url || activeTabUrl;
+      fetch(`http://localhost:3000/api/youtube-formats?url=${encodeURIComponent(targetUrl)}`)
+        .then(res => {
+          if (!res.ok) throw new Error("HTTP error " + res.status);
+          return res.json();
+        })
+        .then(data => {
+          if (data && data.qualities && data.qualities.length > 0) {
+            qualityOptions.innerHTML = "";
+            data.qualities.forEach((q) => {
+              createModalOptionButton(
+                q.label, 
+                q.resolution, 
+                "", 
+                () => {
+                  qualityDialog.classList.add("hidden");
+                  startYoutubeDownload(null, null, video.pageTitle || video.title || "YouTube Video", q.resolution, video.frameId || null, activeTabUrl || video.url);
+                }
+              );
+            });
+          } else {
+            renderFallback();
+          }
+        })
+        .catch(err => {
+          console.warn("[Popup] Failed to fetch real YouTube formats, falling back:", err);
+          renderFallback();
+        });
       return;
     }
 
@@ -570,21 +699,30 @@ function startHlsDownload(m3u8Url, qualityTitle, frameId) {
   showDownloadProgress(0);
 }
 
-function startYoutubeDownload(videoUrl, audioUrl, pageTitle, resolution, frameId) {
-  let title = pageTitle || "youtube_video";
-  if (resolution) {
-    title = `${title}_${resolution}`;
-  }
-  chrome.runtime.sendMessage({
-    action: "start_youtube_download",
-    tabId: activeTabId,
-    videoUrl: videoUrl,
-    audioUrl: audioUrl,
-    pageTitle: title,
-    resolution: resolution,
-    frameId: frameId
+function startYoutubeDownload(videoUrl, audioUrl, pageTitle, resolution, frameId, youtubeUrl = null) {
+  chrome.runtime.sendMessage({ action: "get_backend_status" }, (response) => {
+    const running = response && response.running;
+    if (!running) {
+      showCustomAlert("Please start the backend server first by clicking the 'Start Backend' button in the top-right corner.");
+      return;
+    }
+    
+    let title = pageTitle || "youtube_video";
+    if (resolution) {
+      title = `${title}_${resolution}`;
+    }
+    chrome.runtime.sendMessage({
+      action: "start_youtube_download",
+      tabId: activeTabId,
+      videoUrl: videoUrl,
+      audioUrl: audioUrl,
+      pageTitle: title,
+      resolution: resolution,
+      frameId: frameId,
+      youtubeUrl: youtubeUrl
+    });
+    showDownloadProgress(0);
   });
-  showDownloadProgress(0);
 }
 
 function startCombinedMediaDownload(video) {
@@ -688,8 +826,12 @@ function showDownloadProgress(progress) {
     } else if (progress.status === "completed") {
       bannerDetail.innerHTML = `Assembly complete! Save prompted...`;
       setTimeout(hideDownloadProgress, 4000); // Auto-hide after 4 seconds
-    } else {
+    } else if (progress.statusText) {
+      bannerDetail.innerText = progress.statusText;
+    } else if (progress.segmentIndex !== undefined) {
       bannerDetail.innerText = `Downloading segment ${progress.segmentIndex + 1} of ${progress.totalSegments}`;
+    } else {
+      bannerDetail.innerText = "Downloading media streams...";
     }
   }
 }
@@ -700,6 +842,11 @@ function hideDownloadProgress() {
 
 // Listen to download progress and state reset notifications from background script
 chrome.runtime.onMessage.addListener((message) => {
+  if (message.action === "backend_status_changed") {
+    updateBackendStatusUI();
+    return;
+  }
+
   if (message.tabId !== activeTabId) return;
 
   if (message.action === "video_registry_cleared" || message.action === "video_registry_updated") {
@@ -710,11 +857,49 @@ chrome.runtime.onMessage.addListener((message) => {
     hideDownloadProgress();
     refreshVideoList();
   } else if (message.action === "download_error") {
-    alert(`Download error occurred: ${message.error}`);
+    showCustomAlert(`Download error occurred: ${message.error}`);
     hideDownloadProgress();
     refreshVideoList();
   }
 });
+
+function updateBackendStatusUI() {
+  if (!backendStatusDot || !toggleBackendBtn) return;
+  chrome.runtime.sendMessage({ action: "get_backend_status" }, (response) => {
+    const running = response && response.running;
+    if (running) {
+      backendStatusDot.style.background = "#2ecc71"; // green
+      toggleBackendBtn.innerText = "Stop Backend (Port 3000)";
+      toggleBackendBtn.style.background = "rgba(46, 204, 113, 0.15)";
+      toggleBackendBtn.style.borderColor = "rgba(46, 204, 113, 0.3)";
+    } else {
+      backendStatusDot.style.background = "#ff4d4d"; // red
+      toggleBackendBtn.innerText = "Start Backend";
+      toggleBackendBtn.style.background = "rgba(255, 255, 255, 0.08)";
+      toggleBackendBtn.style.borderColor = "rgba(255, 255, 255, 0.15)";
+    }
+    toggleBackendBtn.disabled = false;
+  });
+}
+
+function handleToggleBackend() {
+  if (!toggleBackendBtn) return;
+  toggleBackendBtn.disabled = true;
+  
+  chrome.runtime.sendMessage({ action: "get_backend_status" }, (response) => {
+    const running = response && response.running;
+    const action = running ? "stop_backend" : "start_backend";
+    
+    toggleBackendBtn.innerText = running ? "Stopping..." : "Starting...";
+    
+    chrome.runtime.sendMessage({ action }, (res) => {
+      if (res && !res.success && res.error) {
+        showCustomAlert(`Failed to configure backend: ${res.error}\n\nPlease double-click "install-host.bat" inside the "extension/backend" folder to register the messaging host.`);
+      }
+      setTimeout(updateBackendStatusUI, 500);
+    });
+  });
+}
 
 // Run
 document.addEventListener("DOMContentLoaded", init);

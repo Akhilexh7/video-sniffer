@@ -396,6 +396,32 @@ body::before {
   animation: slideUp 0.2s ease-out;
 }
 
+.center-dialog {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(14, 22, 32, 0.7);
+  backdrop-filter: blur(12px);
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.15s ease-out;
+}
+
+.center-dialog-content {
+  width: 80%;
+  max-width: 250px;
+  background-color: #0E1620;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  text-align: center;
+}
+
 .dialog-content {
   width: 100%;
   background-color: #0E1620;
@@ -502,10 +528,10 @@ body::before {
 
 /* State Detected layout fixes */
 #state-detected {
-  display: flex !important;
-  flex-direction: column !important;
-  justify-content: flex-start !important;
-  height: auto !important;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  height: auto;
   min-height: 100%;
   width: 100%;
 }

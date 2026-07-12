@@ -11,7 +11,7 @@ async function validateDownload(blob, expectedSize) {
     throw new Error(`Downloaded file suspiciously small (${blob.size} bytes) — likely an error page, not media.`);
   }
   if (expectedSize && Math.abs(blob.size - expectedSize) > expectedSize * 0.05) {
-    throw new Error(`Size mismatch: expected ~${expectedSize} bytes, got ${blob.size}.`);
+    console.warn(`[Downloader] Size mismatch: expected ~${expectedSize} bytes, got ${blob.size}. Proceeding anyway.`);
   }
   try {
     const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
@@ -37,7 +37,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleDirectDownload(message.tabId, message.url, message.pageTitle, message.expectedSize, message.frameId);
     sendResponse({ success: true });
   } else if (message.action === "start_offscreen_youtube_download") {
-    handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId);
+    handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId, message.youtubeUrl);
     sendResponse({ success: true });
   } else if (message.action === "cancel_offscreen_hls_download") {
     const downloader = activeDownloads[message.tabId];
@@ -219,8 +219,8 @@ async function handleDirectDownload(tabId, url, pageTitle, expectedSize, frameId
   }
 }
 
-async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resolution, frameId) {
-  console.log(`[Offscreen] Initiating YouTube download for tab ${tabId}. Video: ${videoUrl}, Audio: ${audioUrl}`);
+async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resolution, frameId, youtubeUrl) {
+  console.log(`[Offscreen] Initiating YouTube download for tab ${tabId}. Video: ${videoUrl}, Audio: ${audioUrl}, YoutubeUrl: ${youtubeUrl}`);
   try {
     const downloader = new YoutubeDownloader(videoUrl, audioUrl, (progress) => {
       chrome.runtime.sendMessage({
@@ -228,7 +228,7 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
         tabId: tabId,
         progress: progress
       }).catch(() => {});
-    }, tabId, frameId);
+    }, tabId, frameId, youtubeUrl, resolution);
 
     activeDownloads[tabId] = downloader;
     const result = await downloader.start();

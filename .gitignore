@@ -2,3 +2,10 @@ PROJECT_ANALYSIS.md
 .agents
 .codex
 IMPLEMENTATION_SUMMARY.txt
+backend/node_modules/
+backend/package-lock.json
+backend/bin/yt-dlp.exe
+backend/com.unvdownloader.backend.json
+backend/output/
+.DS_Store
+Thumbs.db

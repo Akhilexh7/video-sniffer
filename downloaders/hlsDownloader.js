@@ -36,7 +36,9 @@ export class HlsDownloader {
             } else if (response && response.success) {
               resolve({ text: response.data, finalUrl: response.responseUrl || url });
             } else {
-              reject(new Error(response ? response.error : "Failed proxy fetch"));
+              const err = new Error(response ? response.error : "Failed proxy fetch");
+              if (response && response.status === 403) err.status = 403;
+              reject(err);
             }
           });
         });
@@ -45,7 +47,24 @@ export class HlsDownloader {
       }
     }
     
-    const response = await fetch(url, { signal: this.abortController.signal, credentials: 'include' });
+    let response = await fetch(url, { signal: this.abortController.signal, credentials: 'include' });
+    if (response.status === 403 && this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+      console.error('[Download Diagnostics] HTTP 403 Forbidden on direct text fetch', {
+        url: url,
+        timestamp: new Date().toISOString()
+      });
+      console.warn(`[Downloader] Direct fetch for text failed with 403. Trying without Referer...`);
+      await new Promise(r => chrome.runtime.sendMessage({ action: "unregister_dnr_rules", tabId: this.tabId }, r));
+      try {
+        const retryRes = await fetch(url, { signal: this.abortController.signal, credentials: 'include' });
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+        if (retryRes.ok || retryRes.status !== 403) {
+          response = retryRes;
+        }
+      } catch (err) {
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+      }
+    }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
@@ -82,7 +101,9 @@ export class HlsDownloader {
               }
               resolve(bytes.buffer);
             } else {
-              reject(new Error(response ? response.error : "Failed proxy fetch"));
+              const err = new Error(response ? response.error : "Failed proxy fetch");
+              if (response && response.status === 403) err.status = 403;
+              reject(err);
             }
           });
         });
@@ -91,7 +112,25 @@ export class HlsDownloader {
       }
     }
     
-    const res = await fetch(url, { signal: this.abortController.signal, headers, credentials: 'include' });
+    let res = await fetch(url, { signal: this.abortController.signal, headers, credentials: 'include' });
+    if (res.status === 403 && this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+      console.error('[Download Diagnostics] HTTP 403 Forbidden on direct segment fetch', {
+        url: url,
+        range: range,
+        timestamp: new Date().toISOString()
+      });
+      console.warn(`[Downloader] Direct fetch for segment failed with 403. Trying without Referer...`);
+      await new Promise(r => chrome.runtime.sendMessage({ action: "unregister_dnr_rules", tabId: this.tabId }, r));
+      try {
+        const retryRes = await fetch(url, { signal: this.abortController.signal, headers, credentials: 'include' });
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+        if (retryRes.ok || retryRes.status !== 403) {
+          res = retryRes;
+        }
+      } catch (err) {
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+      }
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     if (range && res.status !== 206) {
       throw new Error(`HTTP ${res.status}: server did not return requested byte range`);
@@ -592,7 +631,24 @@ export class HlsDownloader {
   }
 
   async fetchKeyBytes(keyUrl) {
-    const res = await fetch(keyUrl, { signal: this.abortController.signal, credentials: 'include' });
+    let res = await fetch(keyUrl, { signal: this.abortController.signal, credentials: 'include' });
+    if (res.status === 403 && this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+      console.error('[Download Diagnostics] HTTP 403 Forbidden on direct key fetch', {
+        url: keyUrl,
+        timestamp: new Date().toISOString()
+      });
+      console.warn(`[Downloader] Direct fetch for key failed with 403. Trying without Referer...`);
+      await new Promise(r => chrome.runtime.sendMessage({ action: "unregister_dnr_rules", tabId: this.tabId }, r));
+      try {
+        const retryRes = await fetch(keyUrl, { signal: this.abortController.signal, credentials: 'include' });
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+        if (retryRes.ok || retryRes.status !== 403) {
+          res = retryRes;
+        }
+      } catch (err) {
+        chrome.runtime.sendMessage({ action: "register_dnr_rules_for_tab", tabId: this.tabId });
+      }
+    }
     if (!res.ok) throw new Error(`Failed to load key from: ${keyUrl}`);
     return new Uint8Array(await res.arrayBuffer());
   }

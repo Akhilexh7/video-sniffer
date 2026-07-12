@@ -19,6 +19,8 @@ export class DirectMediaDownloader {
   }
 
   async fetchWithProxy(url, options = {}, responseType = "arraybuffer") {
+    const isYoutube = url.includes("googlevideo.com") || url.includes("youtube.com");
+
     if (this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       try {
         return await new Promise((resolve, reject) => {
@@ -55,7 +57,11 @@ export class DirectMediaDownloader {
                 blob: async () => new Blob([bytes])
               });
             } else {
-              reject(new Error(response ? response.error : "Failed proxy fetch"));
+              const err = new Error(response ? response.error : "Failed proxy fetch");
+              if (response && response.status === 403) {
+                err.status = 403;
+              }
+              reject(err);
             }
           });
         });
@@ -65,7 +71,50 @@ export class DirectMediaDownloader {
     }
 
     // Direct fetch fallback if no tabId or chrome runtime is unavailable (e.g. tests or standalone)
-    const res = await fetch(url, options);
+    let res = await fetch(url, options);
+    if (res.status === 403) {
+      console.error('[Download Diagnostics] HTTP 403 Forbidden on direct fetch', {
+        url: url,
+        requestHeaders: options ? options.headers : null,
+        responseHeaders: Object.fromEntries(res.headers.entries ? res.headers.entries() : []),
+        timestamp: new Date().toISOString()
+      });
+
+      if (this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+        console.warn(`[DirectMediaDownloader] Direct fetch failed with 403. Retrying without Referer...`);
+        // 1. Temporarily unregister DNR rules to remove Referer/Origin headers
+        await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ action: "unregister_dnr_rules", tabId: this.tabId }, () => resolve());
+        });
+
+        // 2. Retry the direct fetch
+        try {
+          const retryRes = await fetch(url, options);
+          if (retryRes.ok || retryRes.status !== 403) {
+            console.log(`[DirectMediaDownloader] Fetch without Referer succeeded (status ${retryRes.status})!`);
+            // Re-register DNR rules in background (asynchronously) before returning
+            chrome.runtime.sendMessage({
+              action: "register_dnr_rules_for_tab",
+              tabId: this.tabId
+            });
+            return retryRes;
+          }
+        } catch (err) {
+          console.error(`[DirectMediaDownloader] Retry without Referer failed:`, err);
+        }
+
+        // Re-register DNR rules in background (asynchronously) if retry didn't succeed
+        chrome.runtime.sendMessage({
+          action: "register_dnr_rules_for_tab",
+          tabId: this.tabId
+        });
+      }
+
+      // If we got here, we retried without Referer (or couldn't retry) and still got 403
+      if (isYoutube) {
+        throw new Error("YouTube download URL has expired. Please reload the YouTube page and try downloading again.");
+      }
+    }
     return res;
   }
 
@@ -94,7 +143,7 @@ export class DirectMediaDownloader {
     let mimeType = contentType || "video/mp4";
     if (mimeType.includes("video/webm")) {
       extension = "webm";
-    } else if (mimeType.includes("video/x-matroska") || this.url.toLowerCase().includes(".mkv")) {
+    } else if (mimeType.includes("video/x-matroska") || (this.url && this.url.toLowerCase().includes(".mkv"))) {
       extension = "mkv";
       mimeType = "video/x-matroska";
     } else if (mimeType.includes("audio/")) {
@@ -173,7 +222,19 @@ export class DirectMediaDownloader {
     }
   }
 
+  supportsFileSystemAccess() {
+    return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function";
+  }
+
   async downloadInChunks(url, contentLength) {
+    const MAX_IN_MEMORY_BYTES = 800 * 1024 * 1024; // 800MB safety ceiling
+    if (contentLength > MAX_IN_MEMORY_BYTES && !this.supportsFileSystemAccess()) {
+      throw new Error(
+        `File is ${(contentLength / 1024 / 1024).toFixed(0)}MB — too large for safe in-memory download. ` +
+        `Enable "Direct browser download" in settings to use Chrome's native downloader instead.`
+      );
+    }
+
     const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
     const totalChunks = Math.ceil(contentLength / CHUNK_SIZE);
     const chunks = new Array(totalChunks);

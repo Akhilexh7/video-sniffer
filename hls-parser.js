@@ -114,10 +114,22 @@ export async function parseM3U8(m3u8Url, tabId = null, frameId = null) {
     }
   }
 
+  // Get any fallback default audio URL in case there's no audioGroupId linked to the stream
+  let fallbackAudioUrl = null;
+  const audioGroupKeys = Object.keys(audioGroups);
+  if (audioGroupKeys.length > 0) {
+    const firstGroup = audioGroups[audioGroupKeys[0]];
+    fallbackAudioUrl = selectDefaultAudioRendition(firstGroup)?.url || null;
+  }
+
   streams.forEach((stream) => {
     const renditions = stream.audioGroupId ? (audioGroups[stream.audioGroupId] || []) : [];
+    if (renditions.length === 0 && fallbackAudioUrl) {
+      stream.audioUrl = fallbackAudioUrl;
+    } else {
+      stream.audioUrl = selectDefaultAudioRendition(renditions)?.url || null;
+    }
     stream.audioRenditions = renditions;
-    stream.audioUrl = selectDefaultAudioRendition(renditions)?.url || null;
   });
 
   // Sort streams by resolution/bandwidth descending (highest quality first)
