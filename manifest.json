@@ -15,7 +15,8 @@
     "storage",
     "activeTab",
     "offscreen",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

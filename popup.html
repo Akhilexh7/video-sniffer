@@ -20,7 +20,7 @@
       </div>
     </header>
 
-    <!-- Active Download Banner (Pinned/Fixed below header) -->
+    <!-- Active Download Banner -->
     <div id="download-progress-banner" class="download-banner hidden">
       <div class="banner-info">
         <span class="banner-title">Downloading Stream...</span>
@@ -53,10 +53,13 @@
         </div>
         <h2 class="state-title">Scanning Webpage...</h2>
         <p class="state-desc">Play or refresh the video on the page if it is not detected automatically.</p>
+        <button id="waiting-deep-scan-btn" class="btn btn-secondary" style="margin-top: 16px; padding: 6px 16px; font-size: 11px; border-radius: 6px;">Deep Scan</button>
       </div>
 
       <!-- State 2: Detected Videos List -->
       <div id="state-detected" class="view-state hidden">
+        <div class="control-header">
+        </div>
         <div id="video-list" class="video-list-container">
           <!-- Dynamic Items Injected Here -->
         </div>

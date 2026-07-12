@@ -182,11 +182,13 @@
   async function checkAndPostPlayerResponse() {
     let response = null;
     try {
-      const player = document.getElementById("movie_player");
-      if (player && typeof player.getPlayerResponse === "function") {
-        response = player.getPlayerResponse();
-      } else if (window.ytInitialPlayerResponse) {
+      if (window.ytInitialPlayerResponse) {
         response = window.ytInitialPlayerResponse;
+      } else {
+        const player = document.getElementById("movie_player");
+        if (player && typeof player.getPlayerResponse === "function") {
+          response = player.getPlayerResponse();
+        }
       }
     } catch (e) {}
 

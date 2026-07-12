@@ -53,9 +53,45 @@ function cleanYoutubeUrl(urlStr) {
   }
 }
 
+console.log("[Background] Service worker (re)started at", new Date().toISOString());
+
 // Tab-based video database
 // tabId -> Array of detected video objects
-const tabVideoRegistry = {};
+let tabVideoRegistry = {};
+
+async function loadRegistryFromStorage() {
+  try {
+    const stored = await chrome.storage.session.get("tabVideoRegistry");
+    if (stored && stored.tabVideoRegistry) {
+      tabVideoRegistry = stored.tabVideoRegistry;
+      console.log("[Background] Restored tabVideoRegistry from session storage:", Object.keys(tabVideoRegistry).length, "tabs");
+    }
+  } catch (e) {
+    console.error("[Background] Failed to load registry from session storage:", e);
+  }
+}
+
+// Simple debounce helper
+function debounce(fn, delay) {
+  let timer = null;
+  return (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+}
+
+const persistRegistry = async () => {
+  try {
+    await chrome.storage.session.set({ tabVideoRegistry });
+  } catch (e) {
+    console.error("[Background] Failed to persist registry to session storage:", e);
+  }
+};
+
+const persistDebounced = debounce(persistRegistry, 500);
+
+// Initialize registry load immediately
+loadRegistryFromStorage();
 
 // Active HLS downloads: tabId -> { url, qualityTitle, progress }
 const activeDownloads = {};
@@ -309,6 +345,11 @@ chrome.webRequest.onHeadersReceived.addListener(
     const { url, tabId, type, responseHeaders, statusCode } = details;
     if (tabId < 0) return;
 
+    // Check resourceType FIRST (cheapest early-exit, no string/URL parsing)
+    if (type === "image" || type === "stylesheet" || type === "font" || type === "script") {
+      return;
+    }
+
     // Intercept YouTube streams and prevent them from falling through to generic detection
     if (url.includes("googlevideo.com") || url.includes("youtube.com")) {
       if (url.includes("/videoplayback")) {
@@ -542,6 +583,20 @@ function isPlayableDetectedVideo(video) {
   return !title.includes("video only");
 }
 
+// Limits memory growth by evicting oldest DOM-source video entries first
+function pruneRegistry(tabId) {
+  const MAX_REGISTRY_SIZE = 60;
+  if (!tabVideoRegistry[tabId] || tabVideoRegistry[tabId].length <= MAX_REGISTRY_SIZE) return;
+  
+  const domEntries = tabVideoRegistry[tabId].filter(v => v.quality === "DOM");
+  if (domEntries.length > 0) {
+    const oldest = domEntries[0];
+    tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v !== oldest);
+  } else {
+    tabVideoRegistry[tabId].shift();
+  }
+}
+
 // Registers the detected video, ensuring uniqueness and computing exact options count
 function registerVideo(tabId, video) {
   if (!tabVideoRegistry[tabId]) {
@@ -553,9 +608,11 @@ function registerVideo(tabId, video) {
     if (idx !== -1) {
       tabVideoRegistry[tabId][idx] = video;
     } else {
+      pruneRegistry(tabId);
       tabVideoRegistry[tabId].push(video);
     }
     updateBadgeCount(tabId);
+    persistDebounced();
     chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
     return;
   }
@@ -727,10 +784,12 @@ function registerVideo(tabId, video) {
           }
         }
 
+        pruneRegistry(tabId);
         tabVideoRegistry[tabId].push(video);
         console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
         
         updateBadgeCount(tabId);
+        persistDebounced();
       } else if (existingVideo) {
         let enriched = false;
         
@@ -786,6 +845,8 @@ function registerVideo(tabId, video) {
 
         if (enriched) {
           console.log(`[Detector] Enriched existing video metadata: ${video.url}`);
+          updateBadgeCount(tabId);
+          persistDebounced();
         }
       }
     });
@@ -866,6 +927,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       delete tabYoutubeMediaState[tabId];
       unregisterDnrRulesForDownload(tabId);
       chrome.action.setBadgeText({ tabId, text: "" });
+      persistDebounced();
       chrome.runtime.sendMessage({ action: "video_registry_cleared", tabId: tabId }).catch(() => {});
     }
     sendResponse({ success: true });
@@ -897,6 +959,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabVideoRegistry[tabId].length !== beforeCount) {
         console.log(`[Detector] Unregistered video due to DOM removal: ${message.url}`);
         updateBadgeCount(tabId);
+        persistDebounced();
         chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
       }
     }
@@ -960,6 +1023,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete tabVideoRegistry[tabId];
   delete tabYoutubeMediaState[tabId];
   unregisterDnrRulesForDownload(tabId);
+  persistDebounced();
   if (activeDownloads[tabId]) {
     chrome.runtime.sendMessage({
       action: "cancel_offscreen_hls_download",
@@ -992,12 +1056,25 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     delete tabYoutubeMediaState[tabId];
     unregisterDnrRulesForDownload(tabId);
     chrome.action.setBadgeText({ tabId, text: "" });
+    persistDebounced();
     chrome.runtime.sendMessage({ action: "video_registry_cleared", tabId: tabId }).catch(() => {});
   }
 });
 
 // Sets up and creates the offscreen document if it doesn't already exist
 async function setupOffscreenDocument(path) {
+  try {
+    if (chrome.offscreen.hasDocument) {
+      const existing = await chrome.offscreen.hasDocument();
+      if (existing) {
+        console.log("[Detector] Offscreen document already exists.");
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn("[Detector] Failed to check for existing offscreen document:", e);
+  }
+
   try {
     await chrome.offscreen.createDocument({
       url: path,

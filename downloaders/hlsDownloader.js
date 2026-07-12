@@ -158,7 +158,7 @@ export class HlsDownloader {
         this.isLikelyTransportStream(downloadedVideoTrack.buffers[0]) &&
         (this.isLikelyTransportStream(downloadedAudioTrack.buffers[0]) || this.isLikelyAac(downloadedAudioTrack.buffers[0]))
       ) {
-        const mp4Buffers = this.transmuxTransportStream(downloadedVideoTrack.buffers, downloadedAudioTrack.buffers);
+        const mp4Buffers = this.transmuxTransportStream(downloadedVideoTrack, downloadedAudioTrack);
         return {
           blob: new Blob(mp4Buffers, { type: "video/mp4" }),
           extension: "mp4",
@@ -179,7 +179,7 @@ export class HlsDownloader {
     }
 
     if (this.isLikelyTransportStream(downloadedVideoTrack.buffers[0])) {
-      const mp4Buffers = this.transmuxTransportStream(downloadedVideoTrack.buffers);
+      const mp4Buffers = this.transmuxTransportStream(downloadedVideoTrack);
       return {
         blob: new Blob(mp4Buffers, { type: "video/mp4" }),
         extension: "mp4",
@@ -216,8 +216,6 @@ export class HlsDownloader {
 
   async downloadPlaylistTrack(track) {
     let initSegmentBuffer = null;
-    let cryptoKey = null;
-    let keyIvHex = null;
 
     if (track.initSegmentUrl) {
       console.log(`[Downloader] Fragmented MP4 (fMP4) ${track.label} stream detected. Fetching initialization header: ${track.initSegmentUrl.url}`);
@@ -232,18 +230,23 @@ export class HlsDownloader {
       }
     }
 
-    if (track.keyInfo) {
-      console.log(`[Decryptor] Encrypted ${track.label} HLS stream detected (AES-128). URI: ${track.keyInfo.uri}`);
+    const keyCache = {};
+    const getCryptoKey = async (keyInfo) => {
+      if (!keyInfo) return null;
+      const cacheKey = keyInfo.uri;
+      if (keyCache[cacheKey]) return keyCache[cacheKey];
+
       try {
-        const keyBytes = await this.fetchKeyBytes(track.keyInfo.uri);
-        cryptoKey = await this.importCryptoKey(keyBytes);
-        keyIvHex = track.keyInfo.ivHex;
-        console.log("[Decryptor] Decryption key successfully imported.");
+        console.log(`[Decryptor] Fetching HLS decryption key from: ${keyInfo.uri}`);
+        const keyBytes = await this.fetchKeyBytes(keyInfo.uri);
+        const cryptoKey = await this.importCryptoKey(keyBytes);
+        keyCache[cacheKey] = cryptoKey;
+        return cryptoKey;
       } catch (err) {
-        console.error("[Decryptor] Failed to load encryption keys:", err);
-        throw new Error(`Failed to initialize decryption keys: ${err.message}`);
+        console.error(`[Decryptor] Failed to load encryption key from ${keyInfo.uri}:`, err);
+        throw new Error(`Failed to load decryption key: ${err.message}`);
       }
-    }
+    };
 
     const buffers = new Array(track.segments.length);
     const CONCURRENCY_LIMIT = 3;
@@ -265,14 +268,17 @@ export class HlsDownloader {
           const rawBuffer = await this.fetchSegmentWithRetry(item.url, item.range, 2);
           let finalBuffer = rawBuffer;
           
-          if (cryptoKey) {
-            let iv;
-            if (keyIvHex) {
-              iv = this.parseHexIV(keyIvHex);
-            } else {
-              iv = this.getSegmentIV(track.mediaSequence + item.index);
+          if (item.keyInfo) {
+            const segCryptoKey = await getCryptoKey(item.keyInfo);
+            if (segCryptoKey) {
+              let iv;
+              if (item.keyInfo.ivHex) {
+                iv = this.parseHexIV(item.keyInfo.ivHex);
+              } else {
+                iv = this.getSegmentIV(track.mediaSequence + item.index);
+              }
+              finalBuffer = await this.decryptSegment(rawBuffer, segCryptoKey, iv);
             }
-            finalBuffer = await this.decryptSegment(rawBuffer, cryptoKey, iv);
           }
 
           buffers[item.index] = finalBuffer;
@@ -326,36 +332,57 @@ export class HlsDownloader {
     return bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xf0) === 0xf0;
   }
 
-  transmuxTransportStream(videoBuffers, audioBuffers = null) {
+  transmuxTransportStream(videoTrack, audioTrack = null) {
     const muxjs = globalThis.muxjs;
     if (!muxjs || !muxjs.mp4 || !muxjs.mp4.Transmuxer) {
       throw new Error("MP4 transmuxer is not available in the offscreen document.");
     }
 
-    const collectTransmuxedTrack = (buffers) => {
-      const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
+    const collectTransmuxedTrack = (track) => {
+      const segments = track.segments;
+      const buffers = track.buffers;
       const trackOutput = {
         initSegment: null,
         dataBuffers: [],
         track: null
       };
 
-      transmuxer.on("data", (segment) => {
-        if (segment.track) {
-          trackOutput.track = segment.track;
-        }
-        if (segment.initSegment && !trackOutput.initSegment) {
-          trackOutput.initSegment = segment.initSegment;
-        }
-        if (segment.data) {
-          trackOutput.dataBuffers.push(segment.data);
-        }
-      });
+      // Group segments by discontinuity boundary to reset the transmuxer timeline cleanly
+      const groups = [];
+      let currentGroup = [];
 
-      buffers.forEach((buffer) => {
-        transmuxer.push(new Uint8Array(buffer));
+      segments.forEach((seg, idx) => {
+        if (seg.isDiscontinuity && currentGroup.length > 0) {
+          groups.push(currentGroup);
+          currentGroup = [];
+        }
+        currentGroup.push({ data: buffers[idx] });
       });
-      transmuxer.flush();
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup);
+      }
+
+      groups.forEach((group) => {
+        const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
+        transmuxer.on("data", (segment) => {
+          if (segment.track) {
+            trackOutput.track = segment.track;
+          }
+          if (segment.initSegment && !trackOutput.initSegment) {
+            trackOutput.initSegment = segment.initSegment;
+          }
+          if (segment.data) {
+            trackOutput.dataBuffers.push(segment.data);
+          }
+        });
+
+        group.forEach((item) => {
+          if (item.data) {
+            transmuxer.push(new Uint8Array(item.data));
+          }
+        });
+        transmuxer.flush();
+      });
 
       return trackOutput;
     };
@@ -374,9 +401,9 @@ export class HlsDownloader {
 
     const outputBuffers = [];
 
-    if (audioBuffers) {
-      const videoTrackOutput = collectTransmuxedTrack(videoBuffers);
-      const audioTrackOutput = collectTransmuxedTrack(audioBuffers);
+    if (audioTrack) {
+      const videoTrackOutput = collectTransmuxedTrack(videoTrack);
+      const audioTrackOutput = collectTransmuxedTrack(audioTrack);
 
       const combinedInitSegment = buildCombinedInitSegment(
         [videoTrackOutput.track, audioTrackOutput.track].filter(Boolean)
@@ -393,7 +420,7 @@ export class HlsDownloader {
       outputBuffers.push(...videoTrackOutput.dataBuffers);
       outputBuffers.push(...audioTrackOutput.dataBuffers);
     } else {
-      const videoTrackOutput = collectTransmuxedTrack(videoBuffers);
+      const videoTrackOutput = collectTransmuxedTrack(videoTrack);
       if (videoTrackOutput.initSegment) {
         outputBuffers.push(videoTrackOutput.initSegment);
       }
@@ -407,6 +434,24 @@ export class HlsDownloader {
     return outputBuffers;
   }
 
+  parseKeyLine(line, playlistUrl) {
+    const methodMatch = line.match(/METHOD=([^,\s]+)/i);
+    const uriMatch = line.match(/URI=["']([^"']+)["']/i);
+    const ivMatch = line.match(/IV=0x([0-9a-fA-F]+)/i);
+
+    if (methodMatch && methodMatch[1] === "AES-128" && uriMatch) {
+      return {
+        method: "AES-128",
+        uri: this.resolveUrl(playlistUrl, uriMatch[1]),
+        ivHex: ivMatch ? ivMatch[1] : null
+      };
+    }
+    if (methodMatch && methodMatch[1] === "NONE") {
+      return null;
+    }
+    return undefined; // No change if METHOD isn't matched
+  }
+
   parseSegments(playlistText, playlistUrl = this.m3u8Url) {
     const lines = playlistText.split("\n");
     const segments = [];
@@ -414,8 +459,24 @@ export class HlsDownloader {
     let lastRangeEnd = 0;
     let lastRangeUrl = null;
     
+    let activeKey = null;
+    let isDiscontinuity = false;
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
+
+      if (line.startsWith("#EXT-X-DISCONTINUITY")) {
+        isDiscontinuity = true;
+        continue;
+      }
+
+      if (line.startsWith("#EXT-X-KEY:")) {
+        const parsedKey = this.parseKeyLine(line, playlistUrl);
+        if (parsedKey !== undefined) {
+          activeKey = parsedKey;
+        }
+        continue;
+      }
 
       if (line.startsWith("#EXT-X-BYTERANGE:")) {
         pendingRange = line.substring("#EXT-X-BYTERANGE:".length).trim();
@@ -426,6 +487,17 @@ export class HlsDownloader {
         let urlLine = "";
         for (let j = i + 1; j < lines.length; j++) {
           const nextLine = lines[j].trim();
+          if (nextLine.startsWith("#EXT-X-DISCONTINUITY")) {
+            isDiscontinuity = true;
+            continue;
+          }
+          if (nextLine.startsWith("#EXT-X-KEY:")) {
+            const parsedKey = this.parseKeyLine(nextLine, playlistUrl);
+            if (parsedKey !== undefined) {
+              activeKey = parsedKey;
+            }
+            continue;
+          }
           if (nextLine.startsWith("#EXT-X-BYTERANGE:")) {
             pendingRange = nextLine.substring("#EXT-X-BYTERANGE:".length).trim();
             continue;
@@ -451,7 +523,13 @@ export class HlsDownloader {
             lastRangeEnd = range.end + 1;
             lastRangeUrl = url;
           }
-          segments.push({ url, range });
+          segments.push({
+            url,
+            range,
+            keyInfo: activeKey ? { ...activeKey } : null,
+            isDiscontinuity: isDiscontinuity
+          });
+          isDiscontinuity = false; // Reset discontinuity after consumption
           pendingRange = null;
         }
       }

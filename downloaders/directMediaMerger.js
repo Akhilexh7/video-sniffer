@@ -1,9 +1,24 @@
 // downloaders/directMediaMerger.js
 
+import { remuxMp4AndM4a } from '../mux/mp4-muxer.js';
+import { DirectMediaDownloader } from './directDownloader.js';
+
 export class DirectMediaMerger {
-  constructor(videoUrl, audioUrl) {
+  constructor(videoUrl, audioUrl, onProgress = null, tabId = null, frameId = null) {
     this.videoUrl = videoUrl;
     this.audioUrl = audioUrl;
+    this.onProgress = onProgress;
+    this.tabId = tabId;
+    this.frameId = frameId;
+    this.cancelled = false;
+    this.videoDownloader = null;
+    this.audioDownloader = null;
+  }
+
+  cancel() {
+    this.cancelled = true;
+    if (this.videoDownloader) this.videoDownloader.cancel();
+    if (this.audioDownloader) this.audioDownloader.cancel();
   }
 
   async start() {
@@ -11,117 +26,61 @@ export class DirectMediaMerger {
       throw new Error("Both video and audio URLs are required for media merging.");
     }
 
-    const videoElement = document.createElement("video");
-    const audioElement = document.createElement("audio");
-    videoElement.crossOrigin = "anonymous";
-    audioElement.crossOrigin = "anonymous";
-    videoElement.muted = true;
-    videoElement.playsInline = true;
-    videoElement.preload = "auto";
-    audioElement.preload = "auto";
+    let videoProgress = 0;
+    let audioProgress = 0;
+    let videoBytes = 0;
+    let audioBytes = 0;
+    let videoTotalBytes = 0;
+    let audioTotalBytes = 0;
 
-    const waitForEvent = (element, eventName) => {
-      return new Promise((resolve, reject) => {
-        const onEvent = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = () => {
-          cleanup();
-          reject(new Error(`Failed while waiting for ${eventName}.`));
-        };
-        const cleanup = () => {
-          element.removeEventListener(eventName, onEvent);
-          element.removeEventListener("error", onError);
-        };
-
-        element.addEventListener(eventName, onEvent, { once: true });
-        element.addEventListener("error", onError, { once: true });
+    const updateProgress = () => {
+      if (!this.onProgress) return;
+      const totalBytes = videoBytes + audioBytes;
+      const totalExpectedBytes = videoTotalBytes + audioTotalBytes;
+      const percentage = Math.round((videoProgress + audioProgress) / 2);
+      this.onProgress({
+        percentage,
+        downloadedBytes: totalBytes,
+        totalBytes: totalExpectedBytes > 0 ? totalExpectedBytes : null
       });
     };
 
-    videoElement.src = this.videoUrl;
-    audioElement.src = this.audioUrl;
+    console.log("[DirectMediaMerger] Downloading video track in parallel...");
+    this.videoDownloader = new DirectMediaDownloader(this.videoUrl, (p) => {
+      videoProgress = p.percentage;
+      videoBytes = p.downloadedBytes;
+      if (p.totalBytes) videoTotalBytes = p.totalBytes;
+      updateProgress();
+    }, this.tabId, this.frameId);
 
-    await Promise.all([
-      waitForEvent(videoElement, "loadedmetadata"),
-      waitForEvent(audioElement, "loadedmetadata")
+    console.log("[DirectMediaMerger] Downloading audio track in parallel...");
+    this.audioDownloader = new DirectMediaDownloader(this.audioUrl, (p) => {
+      audioProgress = p.percentage;
+      audioBytes = p.downloadedBytes;
+      if (p.totalBytes) audioTotalBytes = p.totalBytes;
+      updateProgress();
+    }, this.tabId, this.frameId);
+
+    const [videoData, audioData] = await Promise.all([
+      this.videoDownloader.start(),
+      this.audioDownloader.start()
     ]);
 
-    const captureStream = (element) => {
-      if (typeof element.captureStream === "function") return element.captureStream();
-      if (typeof element.mozCaptureStream === "function") return element.mozCaptureStream();
-      return null;
-    };
-
-    const videoStream = captureStream(videoElement);
-    const audioStream = captureStream(audioElement);
-    if (!videoStream || !audioStream) {
-      throw new Error("Media capture is not supported in this browser context.");
+    if (this.cancelled) {
+      throw new Error("Download aborted.");
     }
 
-    const combinedStream = new MediaStream();
-    videoStream.getVideoTracks().forEach((track) => combinedStream.addTrack(track));
-    audioStream.getAudioTracks().forEach((track) => combinedStream.addTrack(track));
+    console.log("[DirectMediaMerger] Remuxing video and audio tracks...");
+    const videoBuffer = await videoData.blob.arrayBuffer();
+    const audioBuffer = await audioData.blob.arrayBuffer();
 
-    if (combinedStream.getVideoTracks().length === 0 || combinedStream.getAudioTracks().length === 0) {
-      throw new Error("Failed to capture both audio and video tracks.");
-    }
-
-    const mimeType = this.pickRecorderMimeType();
-    const recorder = new MediaRecorder(combinedStream, mimeType ? { mimeType } : undefined);
-    const chunks = [];
-
-    recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        chunks.push(event.data);
-      }
-    };
-
-    const stopPromise = new Promise((resolve) => {
-      recorder.addEventListener("stop", resolve, { once: true });
-    });
-
-    await Promise.all([videoElement.play(), audioElement.play()]);
-
-    recorder.start(1000);
-    await Promise.all([
-      waitForEvent(videoElement, "ended"),
-      waitForEvent(audioElement, "ended")
-    ]);
-
-    if (recorder.state !== "inactive") {
-      recorder.stop();
-    }
-    await stopPromise;
-
-    if (chunks.length === 0) {
-      throw new Error("No merged media data was recorded.");
-    }
-
-    const outputMimeType = recorder.mimeType || mimeType || "video/webm";
-    const extension = outputMimeType.includes("mp4") ? "mp4" : "webm";
+    const outputBuffer = remuxMp4AndM4a(videoBuffer, audioBuffer);
+    const blob = new Blob([outputBuffer], { type: "video/mp4" });
 
     return {
-      blob: new Blob(chunks, { type: outputMimeType }),
-      extension,
-      mimeType: outputMimeType
+      blob,
+      extension: "mp4",
+      mimeType: "video/mp4"
     };
-  }
-
-  pickRecorderMimeType() {
-    const candidates = [
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm"
-    ];
-
-    for (const candidate of candidates) {
-      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(candidate)) {
-        return candidate;
-      }
-    }
-
-    return "video/webm";
   }
 }

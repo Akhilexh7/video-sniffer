@@ -660,3 +660,35 @@ body::before {
   background-color: rgba(255, 255, 255, 0.08);
   color: #ffffff;
 }
+
+/* Deep Scan Control Header */
+.control-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 0 4px 10px 4px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 14px;
+  box-sizing: border-box;
+}
+
+.scan-status-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+
+.scan-status-text span {
+  color: var(--accent-secondary);
+  font-weight: 600;
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  min-height: 24px;
+  line-height: 1;
+}

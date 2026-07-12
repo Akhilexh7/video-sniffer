@@ -49,6 +49,61 @@ async function init() {
       qualityDialog.classList.add("hidden");
     }
   });
+
+  const deepScanBtn = document.getElementById("deep-scan-btn");
+  const waitingDeepScanBtn = document.getElementById("waiting-deep-scan-btn");
+  if (deepScanBtn) deepScanBtn.addEventListener("click", triggerDeepScan);
+  if (waitingDeepScanBtn) waitingDeepScanBtn.addEventListener("click", triggerDeepScan);
+}
+
+async function triggerDeepScan() {
+  const deepScanBtn = document.getElementById("deep-scan-btn");
+  const waitingDeepScanBtn = document.getElementById("waiting-deep-scan-btn");
+  
+  const setScanning = (scanning) => {
+    if (deepScanBtn) {
+      deepScanBtn.disabled = scanning;
+      deepScanBtn.innerText = scanning ? "Scanning..." : "Deep Scan";
+    }
+    if (waitingDeepScanBtn) {
+      waitingDeepScanBtn.disabled = scanning;
+      waitingDeepScanBtn.innerText = scanning ? "Scanning..." : "Deep Scan";
+    }
+  };
+
+  if (!activeTabId) return;
+
+  setScanning(true);
+  console.log("[Popup] Triggering Deep Scan in active tab...");
+
+  chrome.tabs.sendMessage(activeTabId, { action: "run_deep_scan" }, (response) => {
+    if (chrome.runtime.lastError) {
+      console.warn("[Popup] Content script unreachable, re-injecting...", chrome.runtime.lastError.message);
+      chrome.scripting.executeScript(
+        { target: { tabId: activeTabId }, files: ["content.js"] },
+        () => {
+          if (chrome.runtime.lastError) {
+            console.error("[Popup] Content script re-injection failed:", chrome.runtime.lastError.message);
+            setScanning(false);
+            return;
+          }
+          // Retry once after injection
+          chrome.tabs.sendMessage(activeTabId, { action: "run_deep_scan" }, (retryResponse) => {
+            setScanning(false);
+            if (chrome.runtime.lastError) {
+              console.error("[Popup] Deep scan retry failed:", chrome.runtime.lastError.message);
+              return;
+            }
+            renderVideoCards(retryResponse?.videos || []);
+          });
+        }
+      );
+      return;
+    }
+    setScanning(false);
+    console.log("[Popup] Deep scan completed successfully.");
+    renderVideoCards(response?.videos || []);
+  });
 }
 
 function refreshVideoList() {
@@ -108,6 +163,11 @@ function renderVideoCards(videos) {
   console.log("[Popup] renderVideoCards called. Videos:", videos);
   videoList.innerHTML = "";
   showState("detected");
+
+  const detectedCountEl = document.getElementById("detected-count");
+  if (detectedCountEl) {
+    detectedCountEl.innerText = videos.length;
+  }
 
   const createCard = (video) => {
     const card = document.createElement("div");

@@ -53,11 +53,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle, frameId) {
   console.log(`[Offscreen] Initiating combined media download for tab ${tabId}`);
   try {
-    const merger = new DirectMediaMerger(videoUrl, audioUrl);
+    const merger = new DirectMediaMerger(videoUrl, audioUrl, (progress) => {
+      chrome.runtime.sendMessage({
+        action: "download_progress_update",
+        tabId: tabId,
+        progress: progress
+      }).catch(() => {});
+    }, tabId, frameId);
     activeDownloads[tabId] = merger;
     const result = await merger.start();
     const blob = result.blob || result;
-    const extension = result.extension || "webm";
+    const extension = result.extension || "mp4";
 
     await validateDownload(blob);
 

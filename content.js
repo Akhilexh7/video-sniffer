@@ -53,10 +53,24 @@ function scanPageForVideos() {
 
   scanAttributesForMediaUrls(document);
   scanPageMarkupForMediaUrls();
+  scanPreloadAndScripts();
+}
+
+function primeVideoMetadata(video) {
+  if (video.preload === "none" || !video.preload) {
+    video.preload = "metadata";
+  }
+  if (video.readyState === 0 && video.src) {
+    try {
+      video.load();
+    } catch (e) {}
+  }
 }
 
 function handleVideoElement(video) {
   if (observedVideoElements.has(video)) return;
+
+  primeVideoMetadata(video);
 
   const checkAndReport = () => {
     const isInsta = isInstagramHost();
@@ -550,6 +564,49 @@ function injectEarlyMediaSnifferScript() {
       try {
         performance.getEntriesByType("resource").forEach((entry) => maybePostUrl(entry.name, "performance_existing"));
       } catch (e) {}
+
+      function hookPlayerLibraries() {
+        if (window.videojs) {
+          const originalVideojs = window.videojs;
+          window.videojs = function(...args) {
+            const player = originalVideojs.apply(this, args);
+            try {
+              const src = player.currentSrc?.() || player.src?.();
+              if (src) maybePostUrl(src, "videojs_init");
+            } catch (e) {}
+            return player;
+          };
+        }
+
+        if (window.jwplayer) {
+          const originalSetup = window.jwplayer.prototype?.setup;
+          if (originalSetup) {
+            window.jwplayer.prototype.setup = function(config) {
+              try {
+                const sources = config?.sources || (config?.file ? [{ file: config.file }] : []);
+                sources.forEach(s => {
+                  if (s.file) maybePostUrl(s.file, "jwplayer_setup");
+                });
+              } catch (e) {}
+              return originalSetup.apply(this, arguments);
+            };
+          }
+        }
+
+        if (window.Hls) {
+          const originalLoadSource = window.Hls.prototype.loadSource;
+          window.Hls.prototype.loadSource = function(url) {
+            maybePostUrl(url, "hlsjs_loadsource");
+            return originalLoadSource.apply(this, arguments);
+          };
+        }
+      }
+
+      let hookAttempts = 0;
+      const hookInterval = setInterval(() => {
+        hookPlayerLibraries();
+        if (++hookAttempts > 20) clearInterval(hookInterval);
+      }, 500);
     })();
   `;
 
@@ -557,6 +614,32 @@ function injectEarlyMediaSnifferScript() {
   script.textContent = scriptStr;
   (document.head || document.documentElement).appendChild(script);
   script.remove();
+}
+
+function scanPreloadAndScripts() {
+  // 1. Scan preloads
+  document.querySelectorAll('link[rel="preload"][as="video"], link[rel="preload"][as="fetch"]').forEach(link => {
+    if (link.href && mightContainMediaUrl(link.href)) {
+      reportMediaCandidate(link.href, "link_preload");
+    }
+  });
+
+  // 2. Scan inline scripts
+  Array.from(document.scripts).forEach(script => {
+    if (!script.textContent || !mightContainMediaUrl(script.textContent)) return;
+    
+    const patterns = [
+      /"?(?:file|src|source|url)"?\s*:\s*"([^"]+\.(?:m3u8|mpd|mp4|webm|mkv|flv|avi|mov|3gp)[^"]*)"/gi,
+      /sources\s*:\s*\[\s*\{[^}]*?"(?:file|src)"\s*:\s*"([^"]+)"/gi
+    ];
+    
+    patterns.forEach(pattern => {
+      let match;
+      while ((match = pattern.exec(script.textContent)) !== null) {
+        reportMediaCandidate(match[1], "inline_script_config");
+      }
+    });
+  });
 }
 
 injectEarlyMediaSnifferScript();
@@ -568,88 +651,55 @@ if (document.readyState === "complete" || document.readyState === "interactive")
   document.addEventListener("DOMContentLoaded", scanPageForVideos);
 }
 
-// 2. Watch for dynamic DOM additions (crucial for Single Page Applications/SPAs)
-const scheduleDeepScan = debounce(() => {
+
+
+function scanPageMarkupForMediaUrlsRaw() {
+  const root = document.documentElement;
+  if (!root) return;
+  const markup = root.innerHTML || "";
+  if (!mightContainMediaUrl(markup)) return;
+  extractMediaUrls(markup).forEach((url) => {
+    reportMediaCandidate(url, "page_markup_deep");
+  });
+}
+
+async function runDeepScan() {
+  console.log("[Detector Deep Scan] Starting manual deep scan...");
+  
+  // 1. Re-run standard DOM detection
+  scanPageForVideos();
+
+  // 2. Prime metadata preload for all video tags
+  document.querySelectorAll("video").forEach(primeVideoMetadata);
+
+  // 3. Perform deep markup, attributes, preload, and script configs scans
   scanAttributesForMediaUrls(document);
-  scanPageMarkupForMediaUrls();
-}, 700);
+  scanPageMarkupForMediaUrlsRaw();
+  scanPreloadAndScripts();
 
-const pageObserver = new MutationObserver((mutations) => {
-  let shouldDeepScan = false;
+  // 4. Wait for background registrations to settle
+  await new Promise((resolve) => setTimeout(resolve, 800));
 
-  mutations.forEach((mutation) => {
-    // Handle removed nodes to unregister DOM-sourced videos
-    if (mutation.removedNodes && mutation.removedNodes.length > 0) {
-      mutation.removedNodes.forEach((node) => {
-        if (node.nodeType !== Node.ELEMENT_NODE) return;
-        if (node.tagName === "VIDEO" && node.src) {
-          chrome.runtime.sendMessage({ action: "unregister_detected_video", url: node.src }).catch(() => {});
-        } else {
-          try {
-            const childVideos = node.querySelectorAll("video");
-            childVideos.forEach((video) => {
-              if (video.src) {
-                chrome.runtime.sendMessage({ action: "unregister_detected_video", url: video.src }).catch(() => {});
-              }
-            });
-          } catch (e) {}
-        }
-      });
-    }
-
-    if (mutation.type === "attributes") {
-      const element = mutation.target;
-      const value = element.getAttribute(mutation.attributeName);
-      if (value && mightContainMediaUrl(value)) {
-        extractMediaUrls(value).forEach((url) => {
-          reportMediaCandidate(url, `attribute_changed:${mutation.attributeName}`, element.poster || null);
-        });
-      }
-      return;
-    }
-
-    mutation.addedNodes.forEach((node) => {
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-      shouldDeepScan = true;
-
-      if (node.tagName === "VIDEO") {
-        handleVideoElement(node);
-      } else {
-        const childVideos = node.querySelectorAll("video");
-        childVideos.forEach((video) => handleVideoElement(video));
-        
-        const childSources = node.querySelectorAll("source");
-        childSources.forEach((source) => {
-          if (source.src) reportVideo(source.src, "source_dynamic");
-        });
-      }
-
-      scanAttributesForMediaUrls(node);
-      if (node.textContent && mightContainMediaUrl(node.textContent)) {
-        extractMediaUrls(node.textContent).forEach((url) => {
-          reportMediaCandidate(url, "dynamic_markup");
-        });
-      }
+  // 5. Query and return the final registry state
+  const response = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: "get_detected_videos" }, (res) => {
+      resolve(res || { videos: [] });
     });
   });
 
-  if (shouldDeepScan) scheduleDeepScan();
-});
+  console.log("[Detector Deep Scan] Complete.");
+  return { videos: response.videos || [] };
+}
 
-pageObserver.observe(document.body || document.documentElement, {
-  childList: true,
-  subtree: true,
-  attributes: true,
-  attributeFilter: ["src", "href", "data-src", "data-hls", "data-m3u8", "data-url", "poster"]
-});
-
-// Responds to duration query from popup to calculate quality file size estimates
+// Responds to queries from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "get_video_duration") {
     const video = document.querySelector("video");
     sendResponse({ duration: video ? video.duration : 0 });
     return true;
+  } else if (message.action === "run_deep_scan") {
+    runDeepScan().then((res) => sendResponse(res));
+    return true; // Keep channel open for async response
   } else if (message.action === "get_video_preview") {
     const video = findMatchingVideo(message.url) || getPrimaryVideo();
     const preview = getVideoPreview(video);
@@ -669,7 +719,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+const frameQueue = [];
+let activeFrameCaptures = 0;
+const MAX_CONCURRENT_CAPTURES = 2;
+
+function queueFrameCapture(videoUrl, seekTo) {
+  return new Promise((resolve) => {
+    frameQueue.push({ videoUrl, seekTo, resolve });
+    processFrameQueue();
+  });
+}
+
+function processFrameQueue() {
+  if (activeFrameCaptures >= MAX_CONCURRENT_CAPTURES || frameQueue.length === 0) return;
+  const { videoUrl, seekTo, resolve } = frameQueue.shift();
+  activeFrameCaptures++;
+
+  generateFrameThumbnailRaw(videoUrl, seekTo)
+    .then((result) => {
+      activeFrameCaptures--;
+      resolve(result);
+      processFrameQueue();
+    })
+    .catch(() => {
+      activeFrameCaptures--;
+      resolve(null);
+      processFrameQueue();
+    });
+}
+
 async function generateFrameThumbnail(videoUrl, seekTo = null) {
+  return queueFrameCapture(videoUrl, seekTo);
+}
+
+async function generateFrameThumbnailRaw(videoUrl, seekTo = null) {
   if (!videoUrl || videoUrl.includes(".m3u8") || videoUrl.startsWith("blob:")) {
     return null;
   }
