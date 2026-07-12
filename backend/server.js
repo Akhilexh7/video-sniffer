@@ -166,6 +166,7 @@ app.post('/api/download-youtube-video', (req, res) => {
 
     if (fs.existsSync(outputPath)) {
         console.log(`[Backend] Video already exists, skipping download: ${fileName}`);
+        downloadProgress[fileName] = 100;
         return res.json({ 
             success: true, 
             message: `Video already downloaded.`,
@@ -237,7 +238,8 @@ app.post('/api/download-youtube-video', (req, res) => {
         // Example: "[download]  28.5% of   34.11MiB"
         const match = output.match(/(\d+(?:\.\d+)?)%\s*of\s*(\d+(?:\.\d+)?)(\w+)/);
         if (match) {
-            const percentage = parseFloat(match[1]);
+            let percentage = parseFloat(match[1]);
+            if (percentage >= 100) percentage = 99;
             const sizeVal = parseFloat(match[2]);
             const unit = match[3].toLowerCase(); // e.g. "mib", "kib"
             
@@ -261,7 +263,8 @@ app.post('/api/download-youtube-video', (req, res) => {
             // Fallback for simple percentage
             const simpleMatch = output.match(/(\d+(?:\.\d+)?)%/);
             if (simpleMatch) {
-                const percentage = parseFloat(simpleMatch[1]);
+                let percentage = parseFloat(simpleMatch[1]);
+                if (percentage >= 100) percentage = 99;
                 const current = downloadProgress[fileName] || {};
                 downloadProgress[fileName] = {
                     progress: percentage,
