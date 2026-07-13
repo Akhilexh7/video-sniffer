@@ -288,7 +288,6 @@ function scanInstagramPageForVideos() {
 
   const extracted = extractInstagramMediaUrls(document.documentElement ? document.documentElement.innerHTML : "");
   const urls = new Set(extracted.videoUrls);
-  const audioUrl = extracted.audioUrls[0] || null;
 
   Array.from(document.scripts || []).forEach((script) => {
     if (script && script.textContent) {
@@ -340,7 +339,9 @@ function scanInstagramPageForVideos() {
   if (urls.size === 0) return false;
 
   Array.from(urls).forEach((url) => {
-    reportVideo(url, "instagram_video_url", null, {}, audioUrl ? { audioUrl } : {});
+    // Keep Instagram downloads as the exact media URL exposed by the page.
+    // Do not infer or attach a second audio URL for browser-side remuxing.
+    reportVideo(url, "instagram_video_url", null);
   });
 
   return true;
@@ -1063,7 +1064,7 @@ window.addEventListener("message", (event) => {
 // Listener for proxy fetches from the extension background/offscreen contexts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "proxy_fetch") {
-    const { url, options, responseType } = message;
+    const { url, options, responseType, requestId } = message;
     
     // Only proxy requests to the same origin as the page, or an allowed CDN domain
     const pageOrigin = window.location.origin;
@@ -1071,7 +1072,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       requestOrigin = new URL(url).origin;
     } catch (e) {
-      sendResponse({ success: false, error: "Invalid URL" });
+      if (requestId) {
+        chrome.runtime.sendMessage({ action: "proxy_fetch_response", requestId, success: false, error: "Invalid URL" }).catch(() => {});
+      } else {
+        sendResponse({ success: false, error: "Invalid URL" });
+      }
       return true;
     }
 
@@ -1080,11 +1085,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (!isSameOrigin && !isKnownCdn) {
       console.warn("[Proxy Fetch] Rejected — origin not allowlisted:", requestOrigin);
-      sendResponse({ success: false, error: "Origin not permitted for proxy fetch" });
+      if (requestId) {
+        chrome.runtime.sendMessage({ action: "proxy_fetch_response", requestId, success: false, error: "Origin not permitted for proxy fetch" }).catch(() => {});
+      } else {
+        sendResponse({ success: false, error: "Origin not permitted for proxy fetch" });
+      }
       return true;
     }
 
-    fetch(url, options)
+    if (requestId) {
+      sendResponse({ success: true, pending: true });
+    }
+
+    // Instagram CDN requests need the current signed-in session and a page
+    // referer.  Content-script fetches otherwise omit cross-site cookies.
+    fetch(url, {
+      ...options,
+      credentials: "include",
+      referrer: window.location.href,
+      referrerPolicy: "strict-origin-when-cross-origin"
+    })
       .then(async (response) => {
         if (!response.ok) {
           if (response.status === 403) {
@@ -1095,12 +1115,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               timestamp: new Date().toISOString()
             });
           }
-          sendResponse({
+          const failPayload = {
             success: false,
             status: response.status,
             statusText: response.statusText,
             error: `HTTP ${response.status} ${response.statusText}`
-          });
+          };
+          if (requestId) {
+            chrome.runtime.sendMessage({ action: "proxy_fetch_response", requestId, ...failPayload }).catch(() => {});
+          } else {
+            sendResponse(failPayload);
+          }
           return;
         }
 
@@ -1114,38 +1139,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         
         if (responseType === "arraybuffer") {
           const buffer = await response.arrayBuffer();
-          let binary = "";
-          const bytes = new Uint8Array(buffer);
-          const len = bytes.byteLength;
-          for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(bytes[i]);
-          }
-          const base64 = btoa(binary);
-          sendResponse({
-            success: true,
-            status: response.status,
-            headers: headers,
-            data: base64,
-            responseType: "base64",
-            responseUrl: response.url
-          });
+          const blob = new Blob([buffer]);
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64 = reader.result.split(',')[1];
+            if (requestId) {
+              chrome.runtime.sendMessage({
+                action: "proxy_fetch_response",
+                requestId: requestId,
+                success: true,
+                status: response.status,
+                headers: headers,
+                data: base64,
+                responseType: "base64",
+                responseUrl: response.url
+              }).catch(() => {});
+            } else {
+              sendResponse({
+                success: true,
+                status: response.status,
+                headers: headers,
+                data: base64,
+                responseType: "base64",
+                responseUrl: response.url
+              });
+            }
+          };
+          reader.readAsDataURL(blob);
         } else {
           const text = await response.text();
-          sendResponse({
+          const successPayload = {
             success: true,
             status: response.status,
             headers: headers,
             data: text,
             responseType: "text",
             responseUrl: response.url
-          });
+          };
+          if (requestId) {
+            chrome.runtime.sendMessage({ action: "proxy_fetch_response", requestId, ...successPayload }).catch(() => {});
+          } else {
+            sendResponse(successPayload);
+          }
         }
       })
       .catch((err) => {
-        sendResponse({
+        const errPayload = {
           success: false,
           error: err.message
-        });
+        };
+        if (requestId) {
+          chrome.runtime.sendMessage({ action: "proxy_fetch_response", requestId, ...errPayload }).catch(() => {});
+        } else {
+          sendResponse(errPayload);
+        }
       });
       
     return true; // Keep channel open for async response

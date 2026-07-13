@@ -142,6 +142,25 @@ app.get('/api/youtube-formats', (req, res) => {
     });
 });
 
+// GET /api/check-support
+app.get('/api/check-support', (req, res) => {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'URL is required' });
+
+    console.log(`[Backend] Checking yt-dlp support for: ${url}`);
+    
+    execFile(ytdlpExecutable, ['--simulate', '--dump-json', url], (error, stdout, stderr) => {
+        if (error) {
+            const errStr = (stderr || error.message).toLowerCase();
+            if (errStr.includes('unsupported url') || errStr.includes('no suitable extractor')) {
+                return res.json({ supported: false });
+            }
+            return res.json({ supported: false });
+        }
+        res.json({ supported: true });
+    });
+});
+
 // GET /api/ping
 app.get('/api/ping', (req, res) => {
     res.json({ pong: true });
@@ -302,6 +321,192 @@ app.post('/api/download-youtube-video', (req, res) => {
         alreadyDownloaded: false
     });
 });
+
+function getSearchQueryFromSpotifyTitle(title) {
+    if (!title) return "";
+    let clean = title.replace(/\s*\|\s*Spotify/gi, "");
+    clean = clean.replace(/\s*-\s*song\s+and\s+lyrics\s+by\s+/gi, " ");
+    clean = clean.replace(/\s*-\s*song\s+by\s+/gi, " ");
+    clean = clean.replace(/\s*-\s*album\s+by\s+/gi, " ");
+    clean = clean.replace(/\s*-\s*playlist\s+by\s+/gi, " ");
+    clean = clean.replace(/\s*-\s*podcast\s+by\s+/gi, " ");
+    return clean.trim();
+}
+
+function fetchSpotifyOEmbed(spotifyUrl) {
+    return new Promise((resolve) => {
+        const oembedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`;
+        https.get(oembedUrl, (response) => {
+            if (response.statusCode !== 200) {
+                return resolve(null);
+            }
+            let data = '';
+            response.on('data', (chunk) => { data += chunk; });
+            response.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    resolve(parsed);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }).on('error', () => {
+            resolve(null);
+        });
+    });
+}
+
+// POST /api/download-spotify-track
+app.post('/api/download-spotify-track', async (req, res) => {
+    const { url, title, quality } = req.body;
+    if (!url) return res.status(400).json({ error: 'Spotify URL is required' });
+
+    console.log(`[Backend] Request received to download Spotify track: ${url} at quality: ${quality || 'best'}`);
+
+    let searchQuery = "";
+    if (title) {
+        searchQuery = getSearchQueryFromSpotifyTitle(title);
+    }
+    if (!searchQuery) {
+        const oembedData = await fetchSpotifyOEmbed(url);
+        if (oembedData && oembedData.title) {
+            searchQuery = oembedData.title;
+        }
+    }
+    if (!searchQuery) {
+        searchQuery = "spotify track";
+    }
+
+    const cleanTitle = searchQuery.replace(/[^a-z0-9\s]/gi, '').replace(/\s+/g, '_').toLowerCase();
+    
+    // Choose format and quality arguments
+    const ext = (quality === '256k') ? 'm4a' : 'mp3';
+    const audioQuality = (quality === 'best' ? '0' : quality.replace('k', 'K'));
+    
+    const fileName = `${cleanTitle}_${quality || 'best'}.${ext}`;
+    const outputPath = path.join(outputDir, fileName);
+    const streamUrl = `/stream/${encodeURIComponent(fileName)}`;
+
+    if (fs.existsSync(outputPath)) {
+        console.log(`[Backend] Audio already exists, skipping download: ${fileName}`);
+        downloadProgress[fileName] = 100;
+        return res.json({ 
+            success: true, 
+            message: `Audio already downloaded.`,
+            streamUrl: streamUrl,
+            fileName: fileName,
+            alreadyDownloaded: true
+        });
+    }
+
+    const ffmpegPath = require('ffmpeg-static');
+
+    const ytdlpArgs = [
+        `ytsearch1:${searchQuery}`,
+        '--no-playlist',
+        '--no-warnings',
+        '--extract-audio',
+        '--audio-format', ext,
+        '--audio-quality', audioQuality,
+        '--output', fileName,
+    ];
+
+    if (ffmpegPath) {
+        console.log(`[Backend] Found static ffmpeg binary: ${ffmpegPath}`);
+        ytdlpArgs.push('--ffmpeg-location', ffmpegPath);
+    }
+
+    console.log(`[Backend] Spawning yt-dlp for Spotify search: "${searchQuery}" with quality: ${quality} (cwd: ${outputDir})`);
+    console.log(`[Backend] Using executable: ${ytdlpExecutable}`);
+    
+    const child = spawn(ytdlpExecutable, ytdlpArgs, { shell: false, cwd: outputDir });
+
+    downloadProgress[fileName] = 1;
+
+    child.on('error', (err) => {
+        console.error(`[Backend] Failed to start yt-dlp process:`, err);
+        downloadProgress[fileName] = -1;
+    });
+
+    child.stdout.on('data', (data) => {
+        const output = data.toString();
+        console.log(`[yt-dlp stdout] ${output.trim()}`);
+        
+        if (output.includes('[ExtractAudio]') || output.includes('[ffmpeg]') || output.includes('Destination:')) {
+            const current = downloadProgress[fileName] || {};
+            downloadProgress[fileName] = {
+                progress: 99,
+                percentage: 99,
+                downloadedBytes: current.totalBytes || 0,
+                totalBytes: current.totalBytes || null,
+                status: 'converting'
+            };
+            return;
+        }
+
+        const match = output.match(/(\d+(?:\.\d+)?)%\s*of\s*(\d+(?:\.\d+)?)(\w+)/);
+        if (match) {
+            let percentage = parseFloat(match[1]);
+            if (percentage >= 100) percentage = 99;
+            const sizeVal = parseFloat(match[2]);
+            const unit = match[3].toLowerCase();
+            
+            let multiplier = 1;
+            if (unit.startsWith('g')) multiplier = 1024 * 1024 * 1024;
+            else if (unit.startsWith('m')) multiplier = 1024 * 1024;
+            else if (unit.startsWith('k')) multiplier = 1024;
+            
+            const totalBytes = Math.round(sizeVal * multiplier);
+            const downloadedBytes = Math.round((percentage / 100) * totalBytes);
+            
+            downloadProgress[fileName] = {
+                progress: percentage,
+                percentage: percentage,
+                downloadedBytes: downloadedBytes,
+                totalBytes: totalBytes,
+                status: 'downloading'
+            };
+        } else {
+            const simpleMatch = output.match(/(\d+(?:\.\d+)?)%/);
+            if (simpleMatch) {
+                let percentage = parseFloat(simpleMatch[1]);
+                if (percentage >= 100) percentage = 99;
+                const current = downloadProgress[fileName] || {};
+                downloadProgress[fileName] = {
+                    progress: percentage,
+                    percentage: percentage,
+                    downloadedBytes: current.downloadedBytes || 0,
+                    totalBytes: current.totalBytes || null,
+                    status: 'downloading'
+                };
+            }
+        }
+    });
+
+    child.stderr.on('data', (data) => {
+        console.error(`[yt-dlp stderr] ${data.toString().trim()}`);
+    });
+
+    child.on('close', (code) => {
+        if (code === 0) {
+            console.log(`\n[Backend] Spotify download SUCCEEDED: ${fileName}`);
+            downloadProgress[fileName] = 100;
+            setTimeout(() => delete downloadProgress[fileName], 60000);
+        } else {
+            console.error(`\n[Backend] Spotify download FAILED with code ${code}`);
+            downloadProgress[fileName] = -1;
+        }
+    });
+
+    res.json({ 
+        success: true, 
+        message: `Download started`,
+        streamUrl: streamUrl,
+        fileName: fileName,
+        alreadyDownloaded: false
+    });
+});
+
 
 // Initialize yt-dlp then start server
 ensureYtdlp()

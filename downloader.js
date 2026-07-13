@@ -5,3 +5,4 @@ export { HlsDownloader } from './downloaders/hlsDownloader.js';
 export { DirectMediaMerger } from './downloaders/directMediaMerger.js';
 export { DirectMediaDownloader } from './downloaders/directDownloader.js';
 export { YoutubeDownloader } from './downloaders/youtubeDownloader.js';
+export { SpotifyDownloader } from './downloaders/spotifyDownloader.js';

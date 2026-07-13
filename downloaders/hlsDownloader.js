@@ -1,5 +1,6 @@
 // downloaders/hlsDownloader.js
 import { remuxFragmentedMp4 } from '../mux/mp4-muxer.js';
+import { DiskBuffer } from './diskBuffer.js';
 
 export class HlsDownloader {
   constructor(m3u8Url, onProgress, audioM3u8Url = null, tabId = null, frameId = null) {
@@ -20,25 +21,40 @@ export class HlsDownloader {
     if (this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       try {
         return await new Promise((resolve, reject) => {
+          const requestId = Math.random().toString(36).substring(2, 15);
+          
+          const responseListener = (message, sender, sendResponse) => {
+            if (message.action === "proxy_fetch_response" && message.requestId === requestId) {
+              chrome.runtime.onMessage.removeListener(responseListener);
+              if (message.success) {
+                resolve({ text: message.data, finalUrl: message.responseUrl || url });
+              } else {
+                const err = new Error(message.error || "Failed proxy fetch");
+                if (message.status === 403) err.status = 403;
+                reject(err);
+              }
+            }
+          };
+
+          chrome.runtime.onMessage.addListener(responseListener);
+
           chrome.runtime.sendMessage({
             action: "background_proxy_fetch",
             tabId: this.tabId,
             frameId: this.frameId,
             url: url,
             responseType: "text",
+            requestId: requestId,
             options: {
-              signal: this.abortController.signal,
               credentials: 'include'
             }
-          }, (response) => {
+          }, (ack) => {
             if (chrome.runtime.lastError) {
+              chrome.runtime.onMessage.removeListener(responseListener);
               reject(new Error(chrome.runtime.lastError.message));
-            } else if (response && response.success) {
-              resolve({ text: response.data, finalUrl: response.responseUrl || url });
-            } else {
-              const err = new Error(response ? response.error : "Failed proxy fetch");
-              if (response && response.status === 403) err.status = 403;
-              reject(err);
+            } else if (ack && !ack.success) {
+              chrome.runtime.onMessage.removeListener(responseListener);
+              reject(new Error(ack.error || "Failed to initiate proxy fetch"));
             }
           });
         });
@@ -78,32 +94,59 @@ export class HlsDownloader {
     if (this.tabId && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
       try {
         return await new Promise((resolve, reject) => {
+          const requestId = Math.random().toString(36).substring(2, 15);
+
+          const responseListener = async (message, sender, sendResponse) => {
+            if (message.action === "proxy_fetch_response" && message.requestId === requestId) {
+              chrome.runtime.onMessage.removeListener(responseListener);
+              if (message.success) {
+                let buffer;
+                if (message.responseType === "arraybuffer") {
+                  if (message.data && (message.data instanceof ArrayBuffer || typeof message.data.byteLength === "number")) {
+                    buffer = message.data;
+                  } else {
+                    reject(new Error("ArrayBuffer serialization failed (received empty/invalid object instead of ArrayBuffer)"));
+                    return;
+                  }
+                } else {
+                  try {
+                    const base64Res = await fetch(`data:application/octet-stream;base64,${message.data}`);
+                    const arrayBuf = await base64Res.arrayBuffer();
+                    buffer = arrayBuf;
+                  } catch (err) {
+                    reject(new Error(`Failed to decode base64 proxy data: ${err.message}`));
+                    return;
+                  }
+                }
+                resolve(buffer);
+              } else {
+                const err = new Error(message.error || "Failed proxy fetch");
+                if (message.status === 403) err.status = 403;
+                reject(err);
+              }
+            }
+          };
+
+          chrome.runtime.onMessage.addListener(responseListener);
+
           chrome.runtime.sendMessage({
             action: "background_proxy_fetch",
             tabId: this.tabId,
             frameId: this.frameId,
             url: url,
             responseType: "arraybuffer",
+            requestId: requestId,
             options: {
-              signal: this.abortController.signal,
               headers: headers,
               credentials: 'include'
             }
-          }, (response) => {
+          }, (ack) => {
             if (chrome.runtime.lastError) {
+              chrome.runtime.onMessage.removeListener(responseListener);
               reject(new Error(chrome.runtime.lastError.message));
-            } else if (response && response.success) {
-              const binaryString = atob(response.data);
-              const len = binaryString.length;
-              const bytes = new Uint8Array(len);
-              for (let i = 0; i < len; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-              }
-              resolve(bytes.buffer);
-            } else {
-              const err = new Error(response ? response.error : "Failed proxy fetch");
-              if (response && response.status === 403) err.status = 403;
-              reject(err);
+            } else if (ack && !ack.success) {
+              chrome.runtime.onMessage.removeListener(responseListener);
+              reject(new Error(ack.error || "Failed to initiate proxy fetch"));
             }
           });
         });
@@ -259,7 +302,7 @@ export class HlsDownloader {
     if (track.initSegmentUrl) {
       console.log(`[Downloader] Fragmented MP4 (fMP4) ${track.label} stream detected. Fetching initialization header: ${track.initSegmentUrl.url}`);
       try {
-        const initBuffer = await this.fetchSegmentWithRetry(track.initSegmentUrl.url, track.initSegmentUrl.range, 2);
+        const initBuffer = await this.fetchSegmentWithRetry(track.initSegmentUrl.url, track.initSegmentUrl.range, 3);
         initSegmentBuffer = initBuffer;
         this.downloadedBytes += initBuffer.byteLength;
         console.log("[Downloader] Initialization segment downloaded successfully.");
@@ -287,10 +330,21 @@ export class HlsDownloader {
       }
     };
 
-    const buffers = new Array(track.segments.length);
+    const tempFileName = `temp_hls_track_${track.label}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.tmp`;
+    const diskBuffer = new DiskBuffer(tempFileName);
+    await diskBuffer.init();
+
+    if (initSegmentBuffer) {
+      await diskBuffer.write(initSegmentBuffer);
+    }
+
+    const segmentSizes = new Array(track.segments.length);
     const CONCURRENCY_LIMIT = 3;
     const queue = track.segments.map((segment, index) => ({ ...segment, index }));
     
+    let nextExpectedIndex = 0;
+    const pendingWrites = new Map();
+
     const downloadWorker = async () => {
       while (queue.length > 0 && !this.cancelled) {
         const item = queue.shift();
@@ -304,7 +358,7 @@ export class HlsDownloader {
               range: item.range
             });
           }
-          const rawBuffer = await this.fetchSegmentWithRetry(item.url, item.range, 2);
+          const rawBuffer = await this.fetchSegmentWithRetry(item.url, item.range, 3);
           let finalBuffer = rawBuffer;
           
           if (item.keyInfo) {
@@ -320,9 +374,22 @@ export class HlsDownloader {
             }
           }
 
-          buffers[item.index] = finalBuffer;
+          segmentSizes[item.index] = finalBuffer.byteLength;
+
+          if (item.index === nextExpectedIndex) {
+            await diskBuffer.write(finalBuffer);
+            nextExpectedIndex++;
+            while (pendingWrites.has(nextExpectedIndex)) {
+              const nextBuf = pendingWrites.get(nextExpectedIndex);
+              pendingWrites.delete(nextExpectedIndex);
+              await diskBuffer.write(nextBuf);
+              nextExpectedIndex++;
+            }
+          } else {
+            pendingWrites.set(item.index, finalBuffer);
+          }
+
           this.downloadedBytes += finalBuffer.byteLength;
-          
           this.downloadedSegments++;
           this.progress = Math.round((this.downloadedSegments / this.totalSegments) * 100);
           this.onProgress({ percentage: this.progress, downloadedBytes: this.downloadedBytes });
@@ -341,8 +408,23 @@ export class HlsDownloader {
     await Promise.all(workers);
 
     if (this.cancelled) {
+      await diskBuffer.cleanup();
       throw new Error("Download aborted.");
     }
+
+    const trackBlob = await diskBuffer.closeAndGetBlob();
+    
+    // Slice trackBlob back into buffers in memory to maintain compatibility with remainder of transmuxing/remuxing pipelines
+    const buffers = [];
+    let offset = 0;
+    for (let i = 0; i < track.segments.length; i++) {
+      const size = segmentSizes[i];
+      const slice = trackBlob.slice(offset, offset + size);
+      buffers.push(await slice.arrayBuffer());
+      offset += size;
+    }
+
+    await diskBuffer.cleanup();
 
     return { ...track, buffers, initSegmentBuffer };
   }
@@ -355,8 +437,9 @@ export class HlsDownloader {
         if (this.cancelled) throw err;
         if (attempt === retries) throw err;
         
-        console.warn(`[Downloader] Segment fetch failed, retrying (${attempt + 1}/${retries}). Url: ${url}`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        const delay = 300 * Math.pow(2, attempt) + Math.random() * 150;
+        console.warn(`[Downloader] Segment fetch failed, retrying in ${Math.round(delay)}ms (attempt ${attempt + 1}/${retries}). Url: ${url}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
   }
@@ -402,7 +485,7 @@ export class HlsDownloader {
       }
 
       groups.forEach((group) => {
-        const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
+        const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
         transmuxer.on("data", (segment) => {
           if (segment.track) {
             trackOutput.track = segment.track;
@@ -456,8 +539,13 @@ export class HlsDownloader {
         outputBuffers.push(audioTrackOutput.initSegment);
       }
 
-      outputBuffers.push(...videoTrackOutput.dataBuffers);
-      outputBuffers.push(...audioTrackOutput.dataBuffers);
+      // Interleave video and audio data buffers segment-by-segment so players
+      // see a properly muxed stream (pushing all-video then all-audio causes no audio)
+      const maxLen = Math.max(videoTrackOutput.dataBuffers.length, audioTrackOutput.dataBuffers.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (i < videoTrackOutput.dataBuffers.length) outputBuffers.push(videoTrackOutput.dataBuffers[i]);
+        if (i < audioTrackOutput.dataBuffers.length) outputBuffers.push(audioTrackOutput.dataBuffers[i]);
+      }
     } else {
       const videoTrackOutput = collectTransmuxedTrack(videoTrack);
       if (videoTrackOutput.initSegment) {

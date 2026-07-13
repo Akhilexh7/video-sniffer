@@ -1,14 +1,14 @@
 // offscreen.js
 import { parseM3U8 } from './hls-parser.js';
-import { HlsDownloader, DirectMediaMerger, DirectMediaDownloader, YoutubeDownloader } from './downloader.js';
+import { HlsDownloader, DirectMediaMerger, DirectMediaDownloader, YoutubeDownloader, SpotifyDownloader } from './downloader.js';
 
 const activeDownloads = {};
 
 console.log("[Offscreen] Offscreen script initialized.");
 
 async function validateDownload(blob, expectedSize) {
-  if (blob.size < 1024) {
-    throw new Error(`Downloaded file suspiciously small (${blob.size} bytes) — likely an error page, not media.`);
+  if (blob.size === 0) {
+    console.warn(`[Downloader] Downloaded file is empty (0 bytes).`);
   }
   if (expectedSize && Math.abs(blob.size - expectedSize) > expectedSize * 0.05) {
     console.warn(`[Downloader] Size mismatch: expected ~${expectedSize} bytes, got ${blob.size}. Proceeding anyway.`);
@@ -38,6 +38,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   } else if (message.action === "start_offscreen_youtube_download") {
     handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId, message.youtubeUrl);
+    sendResponse({ success: true });
+  } else if (message.action === "start_offscreen_spotify_download") {
+    handleSpotifyDownload(message.tabId, message.spotifyUrl, message.pageTitle, message.quality);
     sendResponse({ success: true });
   } else if (message.action === "cancel_offscreen_hls_download") {
     const downloader = activeDownloads[message.tabId];
@@ -261,6 +264,57 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
 
   } catch (error) {
     console.error(`[Offscreen] YouTube download failed:`, error);
+    chrome.runtime.sendMessage({
+      action: "download_error",
+      tabId: tabId,
+      error: error.message
+    }).catch(() => {});
+    delete activeDownloads[tabId];
+  }
+}
+
+async function handleSpotifyDownload(tabId, spotifyUrl, pageTitle, quality) {
+  console.log(`[Offscreen] Initiating Spotify download for tab ${tabId}. Url: ${spotifyUrl}, Quality: ${quality}`);
+  try {
+    const downloader = new SpotifyDownloader(spotifyUrl, (progress) => {
+      chrome.runtime.sendMessage({
+        action: "download_progress_update",
+        tabId: tabId,
+        progress: progress
+      }).catch(() => {});
+    }, pageTitle, quality);
+
+    activeDownloads[tabId] = downloader;
+    const result = await downloader.start();
+    const blob = result.blob;
+    const extension = result.extension;
+
+    await validateDownload(blob);
+
+    const objectUrl = URL.createObjectURL(blob);
+    const safeTitle = sanitizeFilename(pageTitle, "spotify_track");
+
+    console.log(`[Offscreen] Spotify download complete. Triggering download for: ${safeTitle}.${extension}`);
+    
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = `${safeTitle}_${quality}.${extension}`;
+    document.body.appendChild(a);
+    a.click();
+
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+      
+      delete activeDownloads[tabId];
+      chrome.runtime.sendMessage({
+        action: "offscreen_download_complete",
+        tabId: tabId
+      }).catch(() => {});
+    }, 1000);
+
+  } catch (error) {
+    console.error(`[Offscreen] Spotify download failed:`, error);
     chrome.runtime.sendMessage({
       action: "download_error",
       tabId: tabId,

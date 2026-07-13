@@ -8,4 +8,4 @@ backend/bin/yt-dlp.exe
 backend/com.unvdownloader.backend.json
 backend/output/
 .DS_Store
-Thumbs.db
+Thumbs.db 

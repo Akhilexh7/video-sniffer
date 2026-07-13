@@ -1,6 +1,6 @@
 import { parseM3U8 } from './hls-parser.js';
 
-const MIN_DIRECT_MEDIA_SIZE = 100 * 1024; // 100KB — allows small files and clips, filters out tracking assets
+const MIN_DIRECT_MEDIA_SIZE = 1 * 1024 * 1024; // 1MB — filters out small media files, tracking assets, and ad clips
 
 const YOUTUBE_ITAGS = {
   18: { resolution: "360p (MP4)", type: "mp4", title: "YouTube Video (with Audio)", hasAudio: true, hasVideo: true },
@@ -91,53 +91,118 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // Tab-based video database
 // tabId -> Array of detected video objects
-let tabVideoRegistry = {};
+let tabVideoRegistry = new Map();
+let lastTabUrls = new Map();
+let dnrRuleMap = new Map();
+let dnrUrlRegistry = new Map();
+let nextDnrRuleId = 100000;
 
 async function loadRegistryFromStorage() {
   try {
-    const stored = await chrome.storage.session.get("tabVideoRegistry");
-    if (stored && stored.tabVideoRegistry) {
-      tabVideoRegistry = stored.tabVideoRegistry;
-      console.log("[Background] Restored tabVideoRegistry from session storage:", Object.keys(tabVideoRegistry).length, "tabs");
+    const stored = await chrome.storage.session.get([
+      "tabVideoRegistry", 
+      "lastTabUrls", 
+      "dnrRuleMap", 
+      "dnrUrlRegistry",
+      "nextDnrRuleId"
+    ]);
+    if (stored) {
+      if (stored.tabVideoRegistry) {
+        tabVideoRegistry = new Map(Object.entries(stored.tabVideoRegistry).map(([k, v]) => [Number(k), v]));
+        console.log("[Background] Restored tabVideoRegistry from session storage:", tabVideoRegistry.size, "tabs");
+      }
+      if (stored.lastTabUrls) {
+        lastTabUrls = new Map(Object.entries(stored.lastTabUrls).map(([k, v]) => [Number(k), v]));
+      }
+      if (stored.dnrRuleMap) {
+        dnrRuleMap = new Map(Object.entries(stored.dnrRuleMap));
+      }
+      if (stored.dnrUrlRegistry) {
+        dnrUrlRegistry = new Map(Object.entries(stored.dnrUrlRegistry).map(([k, v]) => [Number(k), v]));
+      }
+      if (stored.nextDnrRuleId) {
+        nextDnrRuleId = stored.nextDnrRuleId;
+      }
     }
   } catch (e) {
     console.error("[Background] Failed to load registry from session storage:", e);
   }
 }
 
-// Simple debounce helper
-function debounce(fn, delay) {
+// Debounce helper with maxWait to satisfy Optimization 4
+function debounceWithMaxWait(fn, delay, maxWait) {
   let timer = null;
-  return (...args) => {
+  let maxTimer = null;
+  let lastCall = 0;
+
+  const flush = async (...args) => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), delay);
+    if (maxTimer) clearTimeout(maxTimer);
+    timer = null;
+    maxTimer = null;
+    lastCall = 0;
+    await fn(...args);
+  };
+
+  return (...args) => {
+    const now = Date.now();
+    if (!lastCall) {
+      lastCall = now;
+    }
+
+    if (timer) clearTimeout(timer);
+
+    if (now - lastCall >= maxWait) {
+      flush(...args);
+    } else {
+      timer = setTimeout(() => flush(...args), delay);
+      if (!maxTimer) {
+        maxTimer = setTimeout(() => flush(...args), maxWait - (now - lastCall));
+      }
+    }
   };
 }
 
 const persistRegistry = async () => {
   try {
-    await chrome.storage.session.set({ tabVideoRegistry });
+    const tabVideoRegistryObj = Object.fromEntries(tabVideoRegistry);
+    const lastTabUrlsObj = Object.fromEntries(lastTabUrls);
+    const dnrRuleMapObj = Object.fromEntries(dnrRuleMap);
+    const dnrUrlRegistryObj = Object.fromEntries(dnrUrlRegistry);
+    
+    await chrome.storage.session.set({ 
+      tabVideoRegistry: tabVideoRegistryObj, 
+      lastTabUrls: lastTabUrlsObj,
+      dnrRuleMap: dnrRuleMapObj,
+      dnrUrlRegistry: dnrUrlRegistryObj,
+      nextDnrRuleId
+    });
   } catch (e) {
     console.error("[Background] Failed to persist registry to session storage:", e);
   }
 };
 
-const persistDebounced = debounce(persistRegistry, 500);
+const persistDebounced = debounceWithMaxWait(persistRegistry, 250, 2000);
 
 // Initialize registry load immediately
 loadRegistryFromStorage();
+
+// Flush pending writes on suspend
+chrome.runtime.onSuspend.addListener(() => {
+  console.log("[Background] Service worker suspending, flushing pending writes.");
+  persistRegistry();
+});
 
 // Active HLS downloads: tabId -> { url, qualityTitle, progress }
 const activeDownloads = {};
 
 let creatingOffscreen; // Global promise for offscreen lifecycle
-const dnrUrlRegistry = {}; // tabId -> pageUrl
 const tabRecentAudios = {}; // tabId -> Array of { url, contentType, timestamp }
 
 console.log("[Detector] Service Worker initialized.");
 
 // Register declarativeNetRequest rules to inject Origin/Referer headers for the extension's fetches
-async function registerDnrRulesForDownload(tabId, pageUrl) {
+async function registerDnrRulesForDownload(tabId, pageUrl, mediaUrl = pageUrl) {
   if (!chrome.declarativeNetRequest) {
     console.warn("[DNR] declarativeNetRequest API not available.");
     return;
@@ -147,15 +212,25 @@ async function registerDnrRulesForDownload(tabId, pageUrl) {
     return;
   }
   
-  dnrUrlRegistry[tabId] = pageUrl;
+  dnrUrlRegistry.set(tabId, pageUrl);
   
   try {
-    const urlObj = new URL(pageUrl);
-    const origin = urlObj.origin;
+    const pageUrlObj = new URL(pageUrl);
+    const mediaUrlObj = new URL(mediaUrl);
+    const origin = pageUrlObj.origin;
+    const mediaHost = mediaUrlObj.hostname;
+    const key = `${tabId}:${mediaUrlObj.origin}`;
+    
+    let ruleId = dnrRuleMap.get(key);
+    if (!ruleId) {
+      ruleId = nextDnrRuleId++;
+      dnrRuleMap.set(key, ruleId);
+      persistDebounced();
+    }
     
     const rules = [
       {
-        id: tabId,
+        id: ruleId,
         priority: 1,
         action: {
           type: 'modifyHeaders',
@@ -196,27 +271,28 @@ async function registerDnrRulesForDownload(tabId, pageUrl) {
         },
         condition: {
           initiatorDomains: [chrome.runtime.id],
+          urlFilter: `||${mediaHost}^`,
           resourceTypes: ['xmlhttprequest']
         }
       }
     ];
     
     await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [tabId],
+      removeRuleIds: [ruleId],
       addRules: rules
     });
     
     // Verify it actually stuck
     const active = await chrome.declarativeNetRequest.getSessionRules();
-    const confirmed = active.some(r => r.id === tabId);
+    const confirmed = active.some(r => r.id === ruleId);
     if (!confirmed) {
-      console.warn(`[DNR] Rule for tab ${tabId} did not confirm active, retrying once...`);
+      console.warn(`[DNR] Rule for tab ${tabId} (origin ${origin}) did not confirm active, retrying once...`);
       await chrome.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [tabId],
+        removeRuleIds: [ruleId],
         addRules: rules
       });
     }
-    console.log(`[DNR] Registered and confirmed headers rules for Tab ${tabId}. Referer: ${pageUrl}, Origin: ${origin}`);
+    console.log(`[DNR] Registered headers rules for Tab ${tabId}: ${mediaHost} with referer ${origin}. RuleId: ${ruleId}`);
   } catch (e) {
     console.error("[DNR] Failed to register declarativeNetRequest rules:", e);
   }
@@ -225,10 +301,24 @@ async function registerDnrRulesForDownload(tabId, pageUrl) {
 async function unregisterDnrRulesForDownload(tabId) {
   if (!chrome.declarativeNetRequest) return;
   try {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [tabId]
-    });
-    console.log(`[DNR] Unregistered headers rules for Tab ${tabId}`);
+    const ruleIdsToRemove = [];
+    const keysToRemove = [];
+    
+    for (const [key, ruleId] of dnrRuleMap.entries()) {
+      if (key.startsWith(`${tabId}:`)) {
+        ruleIdsToRemove.push(ruleId);
+        keysToRemove.push(key);
+      }
+    }
+    
+    if (ruleIdsToRemove.length > 0) {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: ruleIdsToRemove
+      });
+      keysToRemove.forEach(k => dnrRuleMap.delete(k));
+      persistDebounced();
+      console.log(`[DNR] Unregistered headers rules for Tab ${tabId}: rules ${ruleIdsToRemove.join(', ')}`);
+    }
   } catch (e) {
     console.error("[DNR] Failed to unregister rules:", e);
   }
@@ -241,8 +331,8 @@ function processYoutubeMedia(tabId, item, pageTitle) {
   
   if (!tabYoutubeMediaState[tabId] || (item.videoId && tabYoutubeMediaState[tabId].videoId !== item.videoId)) {
     console.log(`[Background] New YouTube video detected (videoId: ${item.videoId}). Resetting media state for Tab ${tabId}.`);
-    if (tabVideoRegistry[tabId]) {
-      tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v.type !== "youtube");
+    if (tabVideoRegistry.has(tabId)) {
+      tabVideoRegistry.set(tabId, tabVideoRegistry.get(tabId).filter(v => v.type !== "youtube"));
     }
     tabYoutubeMediaState[tabId] = {
       videoId: item.videoId || null,
@@ -508,16 +598,27 @@ chrome.webRequest.onHeadersReceived.addListener(
       if (contentRangeInfo && contentRangeInfo.total) {
         sizeBytes = contentRangeInfo.total;
       }
-      if (contentLengthHeader && !isManifest) {
-        const size = parseInt(contentLengthHeader.value);
-        const comparableSize = sizeBytes || size;
-        const isInstagram = url.includes("cdninstagram.com");
-        if (!isInstagram && !isNaN(comparableSize) && comparableSize < MIN_DIRECT_MEDIA_SIZE) {
-          console.log(`[Detector] Skipping small network media (${comparableSize} bytes): ${url}`);
-          return;
+      if (!isManifest) {
+        let size = null;
+        if (contentLengthHeader) {
+          size = parseInt(contentLengthHeader.value);
         }
-        if (!sizeBytes && !isNaN(size)) {
-          sizeBytes = size;
+        const comparableSize = sizeBytes || size;
+        if (comparableSize !== null && !isNaN(comparableSize)) {
+          if (comparableSize < MIN_DIRECT_MEDIA_SIZE) {
+            console.log(`[Detector] Skipping small network media (${comparableSize} bytes): ${url}`);
+            return;
+          }
+          if (!sizeBytes) {
+            sizeBytes = comparableSize;
+          }
+        } else {
+          // If size is completely unknown, filter out obvious ad/promo/loop keywords
+          const lowerUrl = url.toLowerCase();
+          if (lowerUrl.includes("ad") || lowerUrl.includes("promo") || lowerUrl.includes("loop") || lowerUrl.includes("badge") || lowerUrl.includes("icon") || lowerUrl.includes("/ad/")) {
+            console.log(`[Detector] Skipping ad/loop network media with unknown size: ${url}`);
+            return;
+          }
         }
       }
 
@@ -576,6 +677,48 @@ chrome.webRequest.onHeadersReceived.addListener(
           if (bs) bytestartVal = parseInt(bs, 10);
         } catch (e) {}
 
+        /* --- Instagram audio stream detection (disabled) ---
+        // Instagram serves video and audio as separate video/mp4 CDN streams.
+        // The audio stream has a DIFFERENT URL path from the video stream.
+        // Detect it by checking if a differently-pathed Instagram CDN video/mp4 is
+        // significantly smaller than an already-registered video on this tab.
+        const isInstagramCdn = url.includes("cdninstagram.com") && (url.includes("bytestart=") || url.includes("byteend="));
+        if (isInstagramCdn && mediaType === "mp4") {
+          const registeredList = tabVideoRegistry.get(tabId) || [];
+          const existingInstaVideo = registeredList.find(v =>
+            v.url && v.url.includes("cdninstagram.com") && !v.audioUrl
+          );
+          if (existingInstaVideo) {
+            // Compare URL paths — if they differ, the new one is likely the audio track
+            let existingPath = "";
+            let newPath = "";
+            try { existingPath = new URL(existingInstaVideo.url).pathname; } catch (e) {}
+            try { newPath = new URL(normalizedMediaUrl).pathname; } catch (e) {}
+            const isDifferentStream = existingPath && newPath && existingPath !== newPath;
+            // Accept it as audio if it's a different path (audio track) or noticeably smaller
+            const newSize = sizeBytes || 0;
+            const existingSize = existingInstaVideo.sizeBytes || 0;
+            const isSmallerStream = existingSize > 0 && newSize > 0 && newSize < existingSize * 0.6;
+            if (isDifferentStream || isSmallerStream) {
+              console.log(`[Detector] Instagram CDN stream looks like audio track (different path or smaller). Storing for pairing. Video: ${existingInstaVideo.url}, Audio: ${normalizedMediaUrl}`);
+              if (!tabRecentAudios[tabId]) tabRecentAudios[tabId] = [];
+              if (!tabRecentAudios[tabId].some(a => a.url === normalizedMediaUrl)) {
+                tabRecentAudios[tabId].push({ url: normalizedMediaUrl, contentType: "video/mp4", timestamp: Date.now() });
+              }
+              // Immediately pair with the existing registered video
+              if (!existingInstaVideo.audioUrl) {
+                existingInstaVideo.audioUrl = normalizedMediaUrl;
+                existingInstaVideo.title = (existingInstaVideo.title || "Video").replace(" + Audio", "") + " + Audio";
+                persistDebounced();
+                chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+                console.log(`[Detector] Paired existing Instagram video with audio stream.`);
+              }
+              return; // Don't register as a separate video entry
+            }
+          }
+        }
+        --- End Instagram audio detection --- */
+
         registerVideo(tabId, {
           url: normalizedMediaUrl,
           type: mediaType,
@@ -588,7 +731,10 @@ chrome.webRequest.onHeadersReceived.addListener(
       }
     }
   },
-  { urls: ["<all_urls>"] },
+  { 
+    urls: ["<all_urls>"],
+    types: ["media", "xmlhttprequest", "object"]
+  },
   ["responseHeaders"]
 );
 
@@ -665,21 +811,60 @@ function isPlayableDetectedVideo(video) {
 // Limits memory growth by evicting oldest DOM-source video entries first
 function pruneRegistry(tabId) {
   const MAX_REGISTRY_SIZE = 60;
-  if (!tabVideoRegistry[tabId] || tabVideoRegistry[tabId].length <= MAX_REGISTRY_SIZE) return;
+  const list = tabVideoRegistry.get(tabId);
+  if (!list || list.length <= MAX_REGISTRY_SIZE) return;
   
-  const domEntries = tabVideoRegistry[tabId].filter(v => v.quality === "DOM");
+  const domEntries = list.filter(v => v.quality === "DOM");
   if (domEntries.length > 0) {
     const oldest = domEntries[0];
-    tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => v !== oldest);
+    tabVideoRegistry.set(tabId, list.filter(v => v !== oldest));
   } else {
-    tabVideoRegistry[tabId].shift();
+    list.shift();
+  }
+}
+
+async function probeSize(url) {
+  const controller = new AbortController();
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      signal: controller.signal
+    });
+    let size = null;
+    const contentRange = res.headers.get("content-range");
+    if (contentRange) {
+      const match = contentRange.match(/bytes\s+\d+-\d+\/(\d+)/i);
+      if (match) size = parseInt(match[1], 10);
+    }
+    if (!size) {
+      const len = res.headers.get("content-length");
+      if (len) size = parseInt(len, 10);
+    }
+    controller.abort();
+    return size;
+  } catch (e) {
+    controller.abort();
+    // Try HEAD request as fallback
+    try {
+      const res = await fetch(url, { method: "HEAD" });
+      const len = res.headers.get("content-length");
+      if (len) return parseInt(len, 10);
+    } catch (_) {}
+    return null;
   }
 }
 
 // Registers the detected video, ensuring uniqueness and computing exact options count
 function registerVideo(tabId, video) {
-  if (!tabVideoRegistry[tabId]) {
-    tabVideoRegistry[tabId] = [];
+  if (!tabVideoRegistry.has(tabId)) {
+    tabVideoRegistry.set(tabId, []);
+  }
+
+  // Instagram's Media panel entries are downloaded directly.  CDN responses
+  // must not be paired heuristically into a separate-audio merge job.
+  if (video.url && video.url.includes("cdninstagram.com")) {
+    delete video.audioUrl;
   }
 
   if (video.bytestart === undefined && video.url) {
@@ -697,12 +882,19 @@ function registerVideo(tabId, video) {
     const activeAudios = recentAudios.filter(a => now - a.timestamp < 30000);
     tabRecentAudios[tabId] = activeAudios; // keep registry pruned
     
-    if (activeAudios.length > 0) {
+    const isInstagramVideo = video.url && video.url.includes("cdninstagram.com");
+
+    if (activeAudios.length > 0 && !isInstagramVideo) {
       let bestAudioUrl = null;
       let highestScore = -1;
       
       activeAudios.forEach((audio) => {
-        const score = calculateUrlSimilarity(video.url, audio.url);
+        let score = calculateUrlSimilarity(video.url, audio.url);
+        // For Instagram CDN, same-origin streams with different paths are still valid audio pairs
+        if (score < 1 && isInstagramVideo && audio.url.includes("cdninstagram.com")) {
+          // Give a minimum score so they can be paired even with different paths
+          score = 1;
+        }
         if (score > highestScore) {
           highestScore = score;
           bestAudioUrl = audio.url;
@@ -715,15 +907,39 @@ function registerVideo(tabId, video) {
         console.log(`[Detector] Paired direct video-only link with audio track. Score: ${highestScore}. Video: ${video.url}, Audio: ${bestAudioUrl}`);
       }
     }
+
+    // Instagram-specific: if this new video could be the AUDIO stream for an already-registered
+    // Instagram video (audio arrives as a standalone video/mp4 before the real video), pair them.
+    if (!isInstagramVideo && !video.audioUrl) {
+      const registeredList = tabVideoRegistry.get(tabId) || [];
+      const existingLarger = registeredList.find(v =>
+        v.url &&
+        v.url.includes("cdninstagram.com") &&
+        !v.audioUrl &&
+        v.url !== video.url &&
+        (v.sizeBytes || 0) > (video.sizeBytes || 0) * 1.4
+      );
+      if (existingLarger) {
+        existingLarger.audioUrl = video.url;
+        existingLarger.title = (existingLarger.title || "Video").replace(" + Audio", "") + " + Audio";
+        console.log(`[Detector] Retroactively paired existing Instagram video as video, new entry as audio. Audio: ${video.url}`);
+        // Don't register the smaller stream as a separate video
+        updateBadgeCount(tabId);
+        persistDebounced();
+        chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+        return;
+      }
+    }
   }
 
   if (video.type === "youtube") {
-    const idx = tabVideoRegistry[tabId].findIndex(v => v.type === "youtube");
+    const registryList = tabVideoRegistry.get(tabId);
+    const idx = registryList.findIndex(v => v.type === "youtube");
     if (idx !== -1) {
-      tabVideoRegistry[tabId][idx] = video;
+      registryList[idx] = video;
     } else {
       pruneRegistry(tabId);
-      tabVideoRegistry[tabId].push(video);
+      registryList.push(video);
     }
     updateBadgeCount(tabId);
     persistDebounced();
@@ -744,7 +960,7 @@ function registerVideo(tabId, video) {
     let existingVideo = null;
     if (isYoutube) {
       const itag = video.itag || (video.url ? new URL(video.url).searchParams.get("itag") : null);
-      existingVideo = tabVideoRegistry[tabId].find(v => {
+      existingVideo = tabVideoRegistry.get(tabId).find(v => {
         const vIsYoutube = (v.url && (v.url.includes("googlevideo.com/videoplayback") || v.url.includes("youtube.com/videoplayback"))) || v.type === "youtube_stream" || v.itag;
         if (vIsYoutube) {
           const vItag = v.itag || (v.url ? new URL(v.url).searchParams.get("itag") : null);
@@ -788,7 +1004,7 @@ function registerVideo(tabId, video) {
       
       const videoFingerprint = getContentFingerprint(video);
       
-      existingVideo = tabVideoRegistry[tabId].find(v => {
+      existingVideo = tabVideoRegistry.get(tabId).find(v => {
         if (getCleanUrl(v.url) === videoCleanUrl) return true;
         
         const vPath = getUrlPath(v.url);
@@ -875,15 +1091,17 @@ function registerVideo(tabId, video) {
           }
 
           if (video.isHlsMaster) {
-            const beforeCount = tabVideoRegistry[tabId].length;
-            tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter((v) => {
+            const list = tabVideoRegistry.get(tabId);
+            const beforeCount = list.length;
+            const filtered = list.filter((v) => {
               return v.type !== "hls" || (v.qualities && v.qualities.length > 0);
             });
-            if (tabVideoRegistry[tabId].length !== beforeCount) {
+            tabVideoRegistry.set(tabId, filtered);
+            if (filtered.length !== beforeCount) {
               console.log("[Detector] Replaced video-only HLS media playlists with master HLS playlist.");
             }
           } else {
-            const hasMasterHls = tabVideoRegistry[tabId].some((v) => {
+            const hasMasterHls = tabVideoRegistry.get(tabId).some((v) => {
               return v.type === "hls" && v.qualities && v.qualities.length > 0;
             });
             if (hasMasterHls) {
@@ -895,11 +1113,15 @@ function registerVideo(tabId, video) {
         }
 
         pruneRegistry(tabId);
-        tabVideoRegistry[tabId].push(video);
+        tabVideoRegistry.get(tabId).push(video);
         console.log(`[Detector] Video registered for Tab ${tabId}: ${video.url}`);
         
         updateBadgeCount(tabId);
         persistDebounced();
+
+        if (tabUrl && video.type !== "youtube" && video.type !== "spotify" && video.type !== "ytdlp") {
+          checkYtdlpSupportInBackground(tabId, tabUrl, currentTitle);
+        }
       } else if (existingVideo) {
         let enriched = false;
         
@@ -908,6 +1130,11 @@ function registerVideo(tabId, video) {
                                  existingVideo.url && existingVideo.url.includes("cdninstagram.com");
         
         if (isInstagramMatch) {
+          // Clear pairings created by older heuristic detection runs.
+          if (existingVideo.audioUrl) {
+            delete existingVideo.audioUrl;
+            enriched = true;
+          }
           const newSize = video.sizeBytes || 0;
           const oldSize = existingVideo.sizeBytes || 0;
           if (newSize > oldSize) {
@@ -958,26 +1185,28 @@ function registerVideo(tabId, video) {
     });
   };
 
-  // If it's a DOM-detected direct video, check its size via HEAD request first
+  // If it's a DOM-detected direct video, check its size first
   if (video.quality === "DOM" && !isYoutube && !isManifest && video.url) {
-    fetch(video.url, { method: "HEAD" })
-      .then((res) => {
-        const len = res.headers.get("content-length");
-        if (len) {
-          const size = parseInt(len);
-          const isInstagram = video.url && video.url.includes("cdninstagram.com");
-          if (!isInstagram && !isNaN(size) && size < MIN_DIRECT_MEDIA_SIZE) {
+    probeSize(video.url)
+      .then((size) => {
+        if (size !== null && !isNaN(size)) {
+          if (size < MIN_DIRECT_MEDIA_SIZE) {
             console.log(`[Detector] Skipping small DOM media (${size} bytes): ${video.url}`);
             return;
           }
-          if (!isNaN(size)) {
-            video.sizeBytes = size;
+          video.sizeBytes = size;
+        } else {
+          // If size is completely unknown, filter out obvious ad/promo/loop keywords to avoid junk cards
+          const lowerUrl = video.url.toLowerCase();
+          if (lowerUrl.includes("ad") || lowerUrl.includes("promo") || lowerUrl.includes("loop") || lowerUrl.includes("badge") || lowerUrl.includes("icon") || lowerUrl.includes("/ad/")) {
+            console.log(`[Detector] Skipping DOM media ad/loop with unknown size: ${video.url}`);
+            return;
           }
         }
         doRegister();
       })
-      .catch((err) => {
-        // Fallback: register anyway if the HEAD request fails
+      .catch(() => {
+        // Fallback: register anyway if probe throws
         doRegister();
       });
   } else {
@@ -987,7 +1216,7 @@ function registerVideo(tabId, video) {
 
 // Recalculates total downloading options available and updates badge text
 function updateBadgeCount(tabId) {
-  const registry = (tabVideoRegistry[tabId] || []).filter(isPlayableDetectedVideo);
+  const registry = (tabVideoRegistry.get(tabId) || []).filter(isPlayableDetectedVideo);
   let totalOptions = 0;
   
   registry.forEach((v) => {
@@ -1008,6 +1237,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     markTabAsActive(activeTabId);
   }
 
+  if (message.action === "proxy_fetch_response") {
+    chrome.runtime.sendMessage(message).catch(() => {});
+    return false;
+  }
+
   if (message.action === "background_proxy_fetch") {
     const options = {};
     if (typeof message.frameId === "number") {
@@ -1017,7 +1251,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       action: "proxy_fetch",
       url: message.url,
       options: message.options,
-      responseType: message.responseType
+      responseType: message.responseType,
+      requestId: message.requestId
     }, options, (response) => {
       if (chrome.runtime.lastError) {
         sendResponse({ success: false, error: chrome.runtime.lastError.message });
@@ -1122,7 +1357,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "clear_video_registry") {
     if (tabId) {
       console.log(`[Detector] Tab ${tabId} requested registry clear (reload).`);
-      tabVideoRegistry[tabId] = [];
+      tabVideoRegistry.set(tabId, []);
       delete tabYoutubeMediaState[tabId];
       unregisterDnrRulesForDownload(tabId);
       chrome.action.setBadgeText({ tabId, text: "" });
@@ -1149,17 +1384,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
   } else if (message.action === "unregister_detected_video") {
     if (tabId && message.url) {
-      const beforeCount = tabVideoRegistry[tabId].length;
-      const cleanUrl = message.url.split('?')[0].split('#')[0].toLowerCase();
-      tabVideoRegistry[tabId] = tabVideoRegistry[tabId].filter(v => {
-        const vCleanUrl = v.url.split('?')[0].split('#')[0].toLowerCase();
-        return vCleanUrl !== cleanUrl;
-      });
-      if (tabVideoRegistry[tabId].length !== beforeCount) {
-        console.log(`[Detector] Unregistered video due to DOM removal: ${message.url}`);
+      const list = tabVideoRegistry.get(tabId);
+      if (list) {
+        const beforeCount = list.length;
+        const cleanUrl = message.url.split('?')[0].split('#')[0].toLowerCase();
+        const filtered = list.filter(v => {
+          const vCleanUrl = v.url.split('?')[0].split('#')[0].toLowerCase();
+          return vCleanUrl !== cleanUrl;
+        });
+        tabVideoRegistry.set(tabId, filtered);
+        if (filtered.length !== beforeCount) {
+          console.log(`[Detector] Unregistered video due to DOM removal: ${message.url}`);
+          updateBadgeCount(tabId);
+          persistDebounced();
+          chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+        }
+      }
+    }
+    sendResponse({ success: true });
+  } else if (message.action === "register_ytdlp_card") {
+    const { tabId, card } = message;
+    if (tabId && card) {
+      if (!tabVideoRegistry.has(tabId)) {
+        tabVideoRegistry.set(tabId, []);
+      }
+      const list = tabVideoRegistry.get(tabId);
+      if (!list.some(v => v.type === card.type)) {
+        list.push(card);
         updateBadgeCount(tabId);
         persistDebounced();
-        chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
       }
     }
     sendResponse({ success: true });
@@ -1169,7 +1422,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (targetTabId) {
       chrome.tabs.get(targetTabId, (tab) => {
         if (chrome.runtime.lastError || !tab) {
-          const videos = (tabVideoRegistry[targetTabId] || []).filter(isPlayableDetectedVideo);
+          const videos = (tabVideoRegistry.get(targetTabId) || []).filter(isPlayableDetectedVideo);
           sendResponse({ videos });
           return;
         }
@@ -1178,10 +1431,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const isYoutubeWatchPage = url.includes("youtube.com/watch") || url.includes("youtu.be/");
         
         if (isYoutubeWatchPage) {
-          if (!tabVideoRegistry[targetTabId]) {
-            tabVideoRegistry[targetTabId] = [];
+          if (!tabVideoRegistry.has(targetTabId)) {
+            tabVideoRegistry.set(targetTabId, []);
           }
-          const registry = tabVideoRegistry[targetTabId];
+          const registry = tabVideoRegistry.get(targetTabId);
           const hasYoutubeCard = registry.some(v => v.type === "youtube");
           
           if (!hasYoutubeCard) {
@@ -1223,7 +1476,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         }
 
-        const videos = (tabVideoRegistry[targetTabId] || []).filter(isPlayableDetectedVideo);
+        const videos = (tabVideoRegistry.get(targetTabId) || []).filter(isPlayableDetectedVideo);
         sendResponse({ videos });
       });
       return true; // Keep message channel open
@@ -1253,6 +1506,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === "start_youtube_download") {
     // Delegate YouTube video download to offscreen document
     handleYoutubeDownload(message.tabId, message.videoUrl, message.audioUrl, message.pageTitle, message.resolution, message.frameId, message.youtubeUrl);
+    sendResponse({ success: true });
+  } else if (message.action === "start_spotify_download") {
+    // Delegate Spotify track download to offscreen document
+    handleSpotifyDownload(message.tabId, message.spotifyUrl, message.pageTitle, message.quality);
     sendResponse({ success: true });
   } else if (message.action === "cancel_hls_download") {
     // Cancel download in offscreen document
@@ -1297,9 +1554,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Cleans up memory when tabs are closed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  delete tabVideoRegistry[tabId];
+  tabVideoRegistry.delete(tabId);
+  lastTabUrls.delete(tabId);
+  dnrUrlRegistry.delete(tabId);
   delete tabYoutubeMediaState[tabId];
   delete tabRecentAudios[tabId];
+  
+  // Clean up activity tracking timers/sets to prevent memory leaks
+  recentlyActiveTabIds.delete(tabId);
+  if (activeTabTimeouts.has(tabId)) {
+    clearTimeout(activeTabTimeouts.get(tabId));
+    activeTabTimeouts.delete(tabId);
+  }
+
   unregisterDnrRulesForDownload(tabId);
   persistDebounced();
   if (activeDownloads[tabId]) {
@@ -1315,22 +1582,31 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Clear tab registry when navigating to a new URL
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url) {
-    // If navigating within youtube.com, let the player response sniffer handle the video transition/registry reset
-    try {
-      const oldUrl = tab.url;
-      const newUrl = changeInfo.url;
-      if (oldUrl && newUrl) {
-        const oldHost = new URL(oldUrl).hostname;
-        const newHost = new URL(newUrl).hostname;
-        if (oldHost.includes("youtube.com") && newHost.includes("youtube.com")) {
-          console.log(`[Detector] Tab ${tabId} navigated within YouTube. Bypassing registry wipe.`);
+    let oldUrl = lastTabUrls.get(tabId);
+    const newUrl = changeInfo.url;
+    lastTabUrls.set(tabId, newUrl);
+    
+    if (!oldUrl && tabVideoRegistry.has(tabId) && tabVideoRegistry.get(tabId).length > 0) {
+      oldUrl = tabVideoRegistry.get(tabId)[0].pageUrl || tabVideoRegistry.get(tabId)[0].url;
+    }
+
+    if (oldUrl) {
+      try {
+        const oldObj = new URL(oldUrl);
+        const newObj = new URL(newUrl);
+        
+        // If same origin and pathname, it's a minor change (query parameters, hash, etc.) -> DO NOT clear registry!
+        if (oldObj.origin === newObj.origin && oldObj.pathname === newObj.pathname) {
+          console.log(`[Detector] Tab ${tabId} minor URL update (${newUrl}). Keeping registry.`);
+          persistDebounced();
           return;
         }
-      }
-    } catch (e) {}
+      } catch (e) {}
+    }
 
-    console.log(`[Detector] Tab ${tabId} navigated to ${changeInfo.url}. Clearing registry.`);
-    tabVideoRegistry[tabId] = [];
+    // Otherwise, it's a substantial URL change: clear registry
+    console.log(`[Detector] Tab ${tabId} navigated to new path: ${newUrl}. Clearing registry.`);
+    tabVideoRegistry.set(tabId, []);
     delete tabYoutubeMediaState[tabId];
     delete tabRecentAudios[tabId];
     unregisterDnrRulesForDownload(tabId);
@@ -1338,10 +1614,74 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     persistDebounced();
     chrome.runtime.sendMessage({ action: "video_registry_cleared", tabId: tabId }).catch(() => {});
   }
+
+  // Check support on page load complete
+  if (changeInfo.status === "complete" && tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("about:") && !tab.url.startsWith("chrome-extension://")) {
+    checkYtdlpSupportInBackground(tabId, tab.url, tab.title);
+  }
 });
+
+async function checkYtdlpSupportInBackground(tabId, url, title) {
+  const isSpotify = url.includes("spotify.com");
+  const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
+  
+  if (isSpotify || isYoutube) {
+    return;
+  }
+  
+  try {
+    const checkUrl = `http://localhost:3000/api/youtube-formats?url=${encodeURIComponent(url)}`;
+    const res = await fetch(checkUrl);
+    if (!res.ok) return;
+    const data = await res.json();
+    
+    if (data && data.qualities && data.qualities.length > 0) {
+      if (!tabVideoRegistry.has(tabId)) {
+        tabVideoRegistry.set(tabId, []);
+      }
+      
+      if (!tabVideoRegistry.get(tabId).some(v => v.type === "ytdlp")) {
+        let siteName = "Media Page";
+        try {
+          const match = url.match(/https?:\/\/(?:www\.)?([^/]+)/i);
+          if (match && match[1]) {
+            siteName = match[1].charAt(0).toUpperCase() + match[1].slice(1);
+          }
+        } catch(e) {}
+        
+        const ytdlpCard = {
+          url: url,
+          type: "ytdlp",
+          quality: "yt-dlp",
+          resolution: "Multi Quality",
+          title: title || "Web Video",
+          pageTitle: title || "Web Video",
+          siteName: siteName,
+          qualities: data.qualities
+        };
+        
+        tabVideoRegistry.get(tabId).push(ytdlpCard);
+        updateBadgeCount(tabId);
+        persistDebounced();
+        chrome.runtime.sendMessage({ action: "video_registry_updated", tabId: tabId }).catch(() => {});
+        console.log(`[Background Check] Registered supported URL with ${data.qualities.length} pre-fetched qualities: ${url}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Background Check] Failed to check support and fetch qualities for ${url}:`, err);
+  }
+}
+
+let offscreenIdleTimer = null;
 
 // Sets up and creates the offscreen document if it doesn't already exist
 async function setupOffscreenDocument(path) {
+  if (offscreenIdleTimer) {
+    clearTimeout(offscreenIdleTimer);
+    offscreenIdleTimer = null;
+    console.log("[Detector] Cleared offscreen document idle timer.");
+  }
+  
   try {
     if (chrome.offscreen.hasDocument) {
       const existing = await chrome.offscreen.hasDocument();
@@ -1368,21 +1708,31 @@ async function setupOffscreenDocument(path) {
   }
 }
 
-// Closes the offscreen document if there are no active downloads
+// Closes the offscreen document if there are no active downloads, using an idle timeout
 async function closeOffscreenDocument() {
   if (Object.keys(activeDownloads).length === 0) {
-    try {
-      await chrome.offscreen.closeDocument();
-      console.log("[Detector] Closed offscreen document.");
-    } catch (e) {
-      // Ignore if already closed
+    if (offscreenIdleTimer) {
+      clearTimeout(offscreenIdleTimer);
     }
+    
+    console.log("[Detector] Starting 30 seconds idle timeout for offscreen document.");
+    offscreenIdleTimer = setTimeout(async () => {
+      offscreenIdleTimer = null;
+      if (Object.keys(activeDownloads).length === 0) {
+        try {
+          await chrome.offscreen.closeDocument();
+          console.log("[Detector] Closed offscreen document after idle timeout.");
+        } catch (e) {
+          // Ignore if already closed
+        }
+      }
+    }, 30000);
   }
 }
 
 // Delegates sequential segment fetching to the offscreen DOM context
 function getFrameUrlForVideo(tabId, url) {
-  const registry = tabVideoRegistry[tabId] || [];
+  const registry = tabVideoRegistry.get(tabId) || [];
   const getCleanUrl = (u) => u ? u.split('?')[0].split('#')[0] : '';
   const cleanUrl = getCleanUrl(url);
   const video = registry.find(v => {
@@ -1408,7 +1758,7 @@ async function handleHlsDownload(tabId, m3u8Url, qualityTitle, frameId) {
     
     const frameUrl = getFrameUrlForVideo(tabId, m3u8Url) || tab?.url;
     if (frameUrl) {
-      await registerDnrRulesForDownload(tabId, frameUrl);
+      await registerDnrRulesForDownload(tabId, frameUrl, m3u8Url);
     }
     
     await chrome.runtime.sendMessage({
@@ -1445,7 +1795,7 @@ async function handleCombinedMediaDownload(tabId, videoUrl, audioUrl, pageTitle,
     
     const frameUrl = getFrameUrlForVideo(tabId, videoUrl) || tab?.url;
     if (frameUrl) {
-      await registerDnrRulesForDownload(tabId, frameUrl);
+      await registerDnrRulesForDownload(tabId, frameUrl, videoUrl);
     }
     
     await chrome.runtime.sendMessage({
@@ -1482,7 +1832,7 @@ async function handleDirectDownload(tabId, url, pageTitle, expectedSize, frameId
     
     const frameUrl = getFrameUrlForVideo(tabId, url) || tab?.url;
     if (frameUrl) {
-      await registerDnrRulesForDownload(tabId, frameUrl);
+      await registerDnrRulesForDownload(tabId, frameUrl, url);
     }
     
     await chrome.runtime.sendMessage({
@@ -1535,6 +1885,39 @@ async function handleYoutubeDownload(tabId, videoUrl, audioUrl, pageTitle, resol
 
   } catch (error) {
     console.error(`[Downloader] YouTube download setup failed:`, error);
+    chrome.runtime.sendMessage({
+      action: "download_error",
+      tabId: tabId,
+      error: error.message
+    }).catch(() => {});
+    delete activeDownloads[tabId];
+    closeOffscreenDocument();
+  }
+}
+
+async function handleSpotifyDownload(tabId, spotifyUrl, pageTitle, quality) {
+  console.log(`[Downloader] Delegating Spotify Download for tab ${tabId} to Offscreen Document. URL: ${spotifyUrl}`);
+  
+  activeDownloads[tabId] = { videoUrl: spotifyUrl, progress: 0 };
+  
+  try {
+    await setupOffscreenDocument('offscreen.html');
+    
+    const tab = await chrome.tabs.get(tabId);
+    const title = pageTitle || ((tab && tab.title) ? tab.title : "spotify_track");
+    
+    await registerDnrRulesForDownload(tabId, spotifyUrl);
+    
+    await chrome.runtime.sendMessage({
+      action: "start_offscreen_spotify_download",
+      tabId: tabId,
+      spotifyUrl: spotifyUrl,
+      pageTitle: title,
+      quality: quality
+    });
+
+  } catch (error) {
+    console.error(`[Downloader] Spotify download setup failed:`, error);
     chrome.runtime.sendMessage({
       action: "download_error",
       tabId: tabId,

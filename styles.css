@@ -670,6 +670,18 @@ body::before {
   background-color: #ef4444;
   color: #ffffff;
 }
+.video-type-badge.spotify {
+  background-color: #1db954;
+  color: #ffffff;
+}
+.video-type-badge.ytdlp {
+  background-color: #8b5cf6;
+  color: #ffffff;
+}
+.video-type-badge.sniff {
+  background-color: #2196f3;
+  color: #ffffff;
+}
 .video-type-badge.hls {
   background-color: var(--text-secondary);
   color: #0E1620;
@@ -718,3 +730,54 @@ body::before {
   min-height: 24px;
   line-height: 1;
 }
+
+/* Material Design Tab Navigation */
+.tab-navigation {
+  display: flex;
+  position: relative;
+  background-color: transparent;
+  height: 48px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 12px;
+  box-sizing: border-box;
+}
+
+.tab-item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+  transition: background-color 0.15s ease;
+}
+
+.tab-item:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.tab-label {
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-secondary);
+  transition: color 0.2s ease;
+}
+
+.tab-item.active .tab-label {
+  color: var(--text-primary);
+}
+
+.tab-indicator-line {
+  position: absolute;
+  bottom: 0;
+  height: 2px;
+  width: 50%;
+  background-color: var(--accent-primary);
+  transition: left 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
